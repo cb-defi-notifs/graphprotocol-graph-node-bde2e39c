@@ -394,7 +394,7 @@ dataSources:
       blockHandlers:
         - handler: handleBlock
           filter:
-            kind: recurring
+            kind: polling
             every: 10
 schema:
   file:
@@ -412,7 +412,7 @@ specVersion: 0.0.2
     let data_source = onchain_data_sources.get(0).unwrap();
     let filter = data_source.mapping.block_handlers[0].filter.clone();
 
-    assert_eq!(BlockHandlerFilter::Recurring { every: 10 }, filter.unwrap());
+    assert_eq!(BlockHandlerFilter::Polling { every: 10 }, filter.unwrap());
 
     assert_eq!("Qmmanifest", manifest.id.as_str());
 }
