@@ -1032,6 +1032,10 @@ pub enum BlockHandlerFilter {
     // Call filter will trigger on all blocks where the data source contract
     // address has been called
     Call,
+    // This filter will trigger once at the startBlock
+    Once,
+    // This filter will trigger in a recurring interval set by the `every` field.
+    Recurring { every: u64 },
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]

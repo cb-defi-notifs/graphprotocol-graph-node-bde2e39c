@@ -624,7 +624,7 @@ impl EthereumBlockFilter {
                     .clone()
                     .into_iter()
                     .any(|block_handler| match block_handler.filter {
-                        Some(ref filter) if *filter == BlockHandlerFilter::Call => true,
+                        Some(BlockHandlerFilter::Call) => true,
                         _ => false,
                     });
 
