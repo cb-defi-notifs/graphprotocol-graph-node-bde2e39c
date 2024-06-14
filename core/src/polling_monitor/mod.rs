@@ -1,3 +1,4 @@
+mod arweave_service;
 mod ipfs_service;
 mod metrics;
 
@@ -8,10 +9,10 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use futures::stream::StreamExt;
-use futures::{stream, Future, FutureExt, TryFutureExt};
 use graph::cheap_clone::CheapClone;
+use graph::futures03::future::BoxFuture;
+use graph::futures03::stream::StreamExt;
+use graph::futures03::{stream, Future, FutureExt, TryFutureExt};
 use graph::parking_lot::Mutex;
 use graph::prelude::tokio;
 use graph::prometheus::{Counter, Gauge};
@@ -23,6 +24,7 @@ use tower::util::rng::HasherRng;
 use tower::{Service, ServiceExt};
 
 pub use self::metrics::PollingMonitorMetrics;
+pub use arweave_service::{arweave_service, ArweaveService};
 pub use ipfs_service::{ipfs_service, IpfsService};
 
 const MIN_BACKOFF: Duration = Duration::from_secs(5);
@@ -100,7 +102,7 @@ pub fn spawn_monitor<ID, S, E, Res: Send + 'static>(
     service: S,
     response_sender: mpsc::UnboundedSender<(ID, Res)>,
     logger: Logger,
-    metrics: PollingMonitorMetrics,
+    metrics: Arc<PollingMonitorMetrics>,
 ) -> PollingMonitor<ID>
 where
     S: Service<ID, Response = Option<Res>, Error = E> + Send + 'static,
@@ -130,7 +132,7 @@ where
 
                         // Nothing on the queue, wait for a queue wake up or cancellation.
                         None => {
-                            futures::future::select(
+                            graph::futures03::future::select(
                                 // Unwrap: `queue` holds a sender.
                                 queue_woken.changed().map(|r| r.unwrap()).boxed(),
                                 cancel_check.closed().boxed(),
@@ -257,7 +259,12 @@ mod tests {
     ) {
         let (svc, handle) = mock::pair();
         let (tx, rx) = mpsc::unbounded_channel();
-        let monitor = spawn_monitor(svc, tx, log::discard(), PollingMonitorMetrics::mock());
+        let monitor = spawn_monitor(
+            svc,
+            tx,
+            log::discard(),
+            Arc::new(PollingMonitorMetrics::mock()),
+        );
         (handle, monitor, rx)
     }
 
@@ -267,7 +274,7 @@ mod tests {
         let shared_svc = tower::buffer::Buffer::new(tower::limit::ConcurrencyLimit::new(svc, 1), 1);
         let make_monitor = |svc| {
             let (tx, rx) = mpsc::unbounded_channel();
-            let metrics = PollingMonitorMetrics::mock();
+            let metrics = Arc::new(PollingMonitorMetrics::mock());
             let monitor = spawn_monitor(svc, tx, log::discard(), metrics);
             (monitor, rx)
         };

@@ -1,8 +1,9 @@
-use graph::prelude::{BlockPtr, CheapClone, QueryExecutionError, QueryResult};
+use graph::{
+    data::query::CacheStatus,
+    prelude::{BlockPtr, CheapClone, QueryExecutionError, QueryResult},
+};
 use std::sync::Arc;
 use std::time::Instant;
-
-use graph::data::graphql::effort::LoadManager;
 
 use crate::execution::{ast as a, *};
 
@@ -26,8 +27,6 @@ pub struct QueryExecutionOptions<R> {
     /// Maximum value for the `skip` argument
     pub max_skip: u32,
 
-    pub load_manager: Arc<LoadManager>,
-
     /// Whether to include an execution trace in the result
     pub trace: bool,
 }
@@ -39,7 +38,7 @@ pub async fn execute_query<R>(
     selection_set: Option<a::SelectionSet>,
     block_ptr: Option<BlockPtr>,
     options: QueryExecutionOptions<R>,
-) -> Arc<QueryResult>
+) -> (Arc<QueryResult>, CacheStatus)
 where
     R: Resolver,
 {
@@ -56,8 +55,11 @@ where
     });
 
     if !query.is_query() {
-        return Arc::new(
-            QueryExecutionError::NotSupported("Only queries are supported".to_string()).into(),
+        return (
+            Arc::new(
+                QueryExecutionError::NotSupported("Only queries are supported".to_string()).into(),
+            ),
+            CacheStatus::default(),
         );
     }
     let selection_set = selection_set
@@ -76,14 +78,13 @@ where
     .await;
     let elapsed = start.elapsed();
     let cache_status = ctx.cache_status.load();
-    options
-        .load_manager
-        .record_work(query.shape_hash, elapsed, cache_status);
+    ctx.resolver
+        .record_work(query.as_ref(), elapsed, cache_status);
     query.log_cache_status(
         &selection_set,
         block_ptr.map(|b| b.number).unwrap_or(0),
         start,
         cache_status.to_string(),
     );
-    result
+    (result, cache_status)
 }

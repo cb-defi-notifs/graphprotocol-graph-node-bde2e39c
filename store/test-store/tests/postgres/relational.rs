@@ -1,16 +1,15 @@
 //! Test mapping of GraphQL schema to a relational schema
 use diesel::connection::SimpleConnection as _;
 use diesel::pg::PgConnection;
-use graph::components::store::EntityKey;
+use graph::components::store::write::{EntityModification, RowGroup};
 use graph::data::store::scalar;
-use graph::data::value::Word;
 use graph::entity;
 use graph::prelude::{
     o, slog, tokio, web3::types::H256, DeploymentHash, Entity, EntityCollection, EntityFilter,
     EntityOrder, EntityQuery, Logger, StopwatchMetrics, Value, ValueType, BLOCK_NUMBER_MAX,
 };
 use graph::prelude::{BlockNumber, MetricsRegistry};
-use graph::schema::InputSchema;
+use graph::schema::{EntityKey, EntityType, InputSchema};
 use graph_store_postgres::layout_for_tests::set_account_like;
 use graph_store_postgres::layout_for_tests::LayoutCache;
 use graph_store_postgres::layout_for_tests::SqlName;
@@ -24,8 +23,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use graph::{
-    components::store::{AttributeNames, EntityType},
-    data::store::scalar::{BigDecimal, BigInt, Bytes},
+    components::store::AttributeNames,
+    data::store::scalar::{BigDecimal, BigInt, Bytes, Timestamp},
 };
 use graph_store_postgres::{
     layout_for_tests::make_dummy_site,
@@ -39,6 +38,19 @@ use crate::postgres::relational_bytes::{row_group_delete, row_group_insert, row_
 const THINGS_GQL: &str = r#"
     type _Schema_ @fulltext(
         name: "userSearch"
+        language: en
+        algorithm: rank
+        include: [
+            {
+                entity: "User",
+                fields: [
+                    { name: "name"},
+                    { name: "email"},
+                ]
+            }
+        ]
+    ) @fulltext(
+        name: "userSearch2"
         language: en
         algorithm: rank
         include: [
@@ -87,6 +99,7 @@ const THINGS_GQL: &str = r#"
         bigIntArray: [BigInt!]!
         color: Color,
         int8: Int8,
+        timestamp: Timestamp
     }
 
     interface Pet {
@@ -159,7 +172,8 @@ const THINGS_GQL: &str = r#"
 lazy_static! {
     static ref THINGS_SUBGRAPH_ID: DeploymentHash = DeploymentHash::new("things").unwrap();
     static ref THINGS_SCHEMA: InputSchema =
-        InputSchema::parse(THINGS_GQL, THINGS_SUBGRAPH_ID.clone()).expect("failed to parse schema");
+        InputSchema::parse_latest(THINGS_GQL, THINGS_SUBGRAPH_ID.clone())
+            .expect("failed to parse schema");
     static ref NAMESPACE: Namespace = Namespace::new("sgd0815".to_string()).unwrap();
     static ref LARGE_INT: BigInt = BigInt::from(std::i64::MAX).pow(17).unwrap();
     static ref LARGE_DECIMAL: BigDecimal =
@@ -181,6 +195,7 @@ lazy_static! {
             bool: true,
             int: std::i32::MAX,
             int8: std::i64::MAX,
+            timestamp: Value::Timestamp(Timestamp::from_microseconds_since_epoch(1710837304040956).expect("failed to create timestamp")),
             bigDecimal: decimal.clone(),
             bigDecimalArray: vec![decimal.clone(), (decimal + 1.into())],
             string: "scalar",
@@ -197,35 +212,42 @@ lazy_static! {
             id: "one",
         }
     };
-    static ref SCALAR: EntityType = EntityType::from("Scalar");
-    static ref NO_ENTITY: EntityType = EntityType::from("NoEntity");
-    static ref NULLABLE_STRINGS: EntityType = EntityType::from("NullableStrings");
+    static ref SCALAR_TYPE: EntityType = THINGS_SCHEMA.entity_type("Scalar").unwrap();
+    static ref USER_TYPE: EntityType = THINGS_SCHEMA.entity_type("User").unwrap();
+    static ref DOG_TYPE: EntityType = THINGS_SCHEMA.entity_type("Dog").unwrap();
+    static ref CAT_TYPE: EntityType = THINGS_SCHEMA.entity_type("Cat").unwrap();
+    static ref FERRET_TYPE: EntityType = THINGS_SCHEMA.entity_type("Ferret").unwrap();
+    static ref MINK_TYPE: EntityType = THINGS_SCHEMA.entity_type("Mink").unwrap();
+    static ref CHAIR_TYPE: EntityType = THINGS_SCHEMA.entity_type("Chair").unwrap();
+    static ref NULLABLE_STRINGS_TYPE: EntityType =
+        THINGS_SCHEMA.entity_type("NullableStrings").unwrap();
     static ref MOCK_STOPWATCH: StopwatchMetrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         THINGS_SUBGRAPH_ID.clone(),
         "test",
         Arc::new(MetricsRegistry::mock()),
+        "test_shard".to_string()
     );
 }
 
 /// Removes test data from the database behind the store.
-fn remove_schema(conn: &PgConnection) {
+fn remove_schema(conn: &mut PgConnection) {
     let query = format!("drop schema if exists {} cascade", NAMESPACE.as_str());
     conn.batch_execute(&query)
         .expect("Failed to drop test schema");
 }
 
 fn insert_entity_at(
-    conn: &PgConnection,
+    conn: &mut PgConnection,
     layout: &Layout,
-    entity_type: &str,
+    entity_type: &EntityType,
     mut entities: Vec<Entity>,
     block: BlockNumber,
 ) {
     let entities_with_keys_owned = entities
         .drain(..)
         .map(|entity| {
-            let key = EntityKey::data(entity_type.to_owned(), entity.id());
+            let key = entity_type.key(entity.id());
             (key, entity)
         })
         .collect::<Vec<(EntityKey, Entity)>>();
@@ -233,7 +255,6 @@ fn insert_entity_at(
         .iter()
         .map(|(key, entity)| (key, entity))
         .collect();
-    let entity_type = EntityType::from(entity_type);
     let errmsg = format!(
         "Failed to insert entities {}[{:?}]",
         entity_type, entities_with_keys
@@ -246,21 +267,26 @@ fn insert_entity_at(
     );
 }
 
-fn insert_entity(conn: &PgConnection, layout: &Layout, entity_type: &str, entities: Vec<Entity>) {
+fn insert_entity(
+    conn: &mut PgConnection,
+    layout: &Layout,
+    entity_type: &EntityType,
+    entities: Vec<Entity>,
+) {
     insert_entity_at(conn, layout, entity_type, entities, 0);
 }
 
 fn update_entity_at(
-    conn: &PgConnection,
+    conn: &mut PgConnection,
     layout: &Layout,
-    entity_type: &str,
+    entity_type: &EntityType,
     mut entities: Vec<Entity>,
     block: BlockNumber,
 ) {
     let entities_with_keys_owned: Vec<(EntityKey, Entity)> = entities
         .drain(..)
         .map(|entity| {
-            let key = EntityKey::data(entity_type.to_owned(), entity.id());
+            let key = entity_type.key(entity.id());
             (key, entity)
         })
         .collect();
@@ -269,7 +295,6 @@ fn update_entity_at(
         .map(|(key, entity)| (key, entity))
         .collect();
 
-    let entity_type = EntityType::from(entity_type);
     let errmsg = format!(
         "Failed to insert entities {}[{:?}]",
         entity_type, entities_with_keys
@@ -280,10 +305,10 @@ fn update_entity_at(
 }
 
 fn insert_user_entity(
-    conn: &PgConnection,
+    conn: &mut PgConnection,
     layout: &Layout,
     id: &str,
-    entity_type: &str,
+    entity_type: &EntityType,
     name: &str,
     email: &str,
     age: i32,
@@ -344,12 +369,12 @@ fn make_user(
     user
 }
 
-fn insert_users(conn: &PgConnection, layout: &Layout) {
+fn insert_users(conn: &mut PgConnection, layout: &Layout) {
     insert_user_entity(
         conn,
         layout,
         "1",
-        "User",
+        &*USER_TYPE,
         "Johnton",
         "tonofjohn@email.com",
         67_i32,
@@ -364,7 +389,7 @@ fn insert_users(conn: &PgConnection, layout: &Layout) {
         conn,
         layout,
         "2",
-        "User",
+        &*USER_TYPE,
         "Cindini",
         "dinici@email.com",
         43_i32,
@@ -379,7 +404,7 @@ fn insert_users(conn: &PgConnection, layout: &Layout) {
         conn,
         layout,
         "3",
-        "User",
+        &*USER_TYPE,
         "Shaqueeena",
         "teeko@email.com",
         28_i32,
@@ -393,10 +418,10 @@ fn insert_users(conn: &PgConnection, layout: &Layout) {
 }
 
 fn update_user_entity(
-    conn: &PgConnection,
+    conn: &mut PgConnection,
     layout: &Layout,
     id: &str,
-    entity_type: &str,
+    entity_type: &EntityType,
     name: &str,
     email: &str,
     age: i32,
@@ -423,9 +448,9 @@ fn update_user_entity(
 }
 
 fn insert_pet(
-    conn: &PgConnection,
+    conn: &mut PgConnection,
     layout: &Layout,
-    entity_type: &str,
+    entity_type: &EntityType,
     id: &str,
     name: &str,
     block: BlockNumber,
@@ -437,13 +462,13 @@ fn insert_pet(
     insert_entity_at(conn, layout, entity_type, vec![pet], block);
 }
 
-fn insert_pets(conn: &PgConnection, layout: &Layout) {
-    insert_pet(conn, layout, "Dog", "pluto", "Pluto", 0);
-    insert_pet(conn, layout, "Cat", "garfield", "Garfield", 0);
+fn insert_pets(conn: &mut PgConnection, layout: &Layout) {
+    insert_pet(conn, layout, &*DOG_TYPE, "pluto", "Pluto", 0);
+    insert_pet(conn, layout, &*CAT_TYPE, "garfield", "Garfield", 0);
 }
 
-fn create_schema(conn: &PgConnection) -> Layout {
-    let schema = InputSchema::parse(THINGS_GQL, THINGS_SUBGRAPH_ID.clone()).unwrap();
+fn create_schema(conn: &mut PgConnection) -> Layout {
+    let schema = InputSchema::parse_latest(THINGS_GQL, THINGS_SUBGRAPH_ID.clone()).unwrap();
     let site = make_dummy_site(
         THINGS_SUBGRAPH_ID.clone(),
         NAMESPACE.clone(),
@@ -497,7 +522,7 @@ macro_rules! assert_entity_eq {
 /// Test harness for running database integration tests.
 fn run_test<F>(test: F)
 where
-    F: FnOnce(&PgConnection, &Layout),
+    F: FnOnce(&mut PgConnection, &Layout),
 {
     run_test_with_conn(|conn| {
         // Reset state before starting
@@ -514,13 +539,13 @@ where
 #[test]
 fn find() {
     run_test(|conn, layout| {
-        insert_entity(conn, layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
+        insert_entity(conn, layout, &*SCALAR_TYPE, vec![SCALAR_ENTITY.clone()]);
 
         // Happy path: find existing entity
         let entity = layout
             .find(
                 conn,
-                &EntityKey::data(SCALAR.as_str(), "one"),
+                &SCALAR_TYPE.parse_key("one").unwrap(),
                 BLOCK_NUMBER_MAX,
             )
             .expect("Failed to read Scalar[one]")
@@ -531,25 +556,11 @@ fn find() {
         let entity = layout
             .find(
                 conn,
-                &EntityKey::data(SCALAR.as_str(), "noone"),
+                &SCALAR_TYPE.parse_key("noone").unwrap(),
                 BLOCK_NUMBER_MAX,
             )
             .expect("Failed to read Scalar[noone]");
         assert!(entity.is_none());
-
-        // Find for non-existing entity type
-        let err = layout.find(
-            conn,
-            &EntityKey::data(NO_ENTITY.as_str(), "one"),
-            BLOCK_NUMBER_MAX,
-        );
-        match err {
-            Err(e) => assert_eq!("unknown table 'NoEntity'", e.to_string()),
-            _ => {
-                println!("{:?}", err);
-                assert!(false)
-            }
-        }
     });
 }
 
@@ -559,7 +570,7 @@ fn insert_null_fulltext_fields() {
         insert_entity(
             conn,
             layout,
-            "NullableStrings",
+            &*NULLABLE_STRINGS_TYPE,
             vec![EMPTY_NULLABLESTRINGS_ENTITY.clone()],
         );
 
@@ -567,7 +578,7 @@ fn insert_null_fulltext_fields() {
         let entity = layout
             .find(
                 conn,
-                &EntityKey::data(NULLABLE_STRINGS.as_str(), "one"),
+                &NULLABLE_STRINGS_TYPE.parse_key("one").unwrap(),
                 BLOCK_NUMBER_MAX,
             )
             .expect("Failed to read NullableStrings[one]")
@@ -579,16 +590,16 @@ fn insert_null_fulltext_fields() {
 #[test]
 fn update() {
     run_test(|conn, layout| {
-        insert_entity(conn, layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
+        insert_entity(conn, layout, &*SCALAR_TYPE, vec![SCALAR_ENTITY.clone()]);
 
         // Update with overwrite
         let mut entity = SCALAR_ENTITY.clone();
         entity.set("string", "updated").unwrap();
         entity.remove("strings");
         entity.set("bool", Value::Null).unwrap();
-        let key = EntityKey::data("Scalar".to_owned(), entity.id());
+        let key = SCALAR_TYPE.key(entity.id());
 
-        let entity_type = EntityType::from("Scalar");
+        let entity_type = layout.input_schema.entity_type("Scalar").unwrap();
         let entities = vec![(key, entity.clone())];
         let group = row_group_update(&entity_type, 0, entities);
         layout
@@ -598,7 +609,7 @@ fn update() {
         let actual = layout
             .find(
                 conn,
-                &EntityKey::data(SCALAR.as_str(), "one"),
+                &SCALAR_TYPE.parse_key("one").unwrap(),
                 BLOCK_NUMBER_MAX,
             )
             .expect("Failed to read Scalar[one]")
@@ -618,7 +629,7 @@ fn update_many() {
         insert_entity(
             conn,
             layout,
-            "Scalar",
+            &*SCALAR_TYPE,
             vec![one.clone(), two.clone(), three.clone()],
         );
 
@@ -637,10 +648,10 @@ fn update_many() {
         three.set("color", "red").unwrap();
 
         // generate keys
-        let entity_type = EntityType::from("Scalar");
+        let entity_type = layout.input_schema.entity_type("Scalar").unwrap();
         let keys: Vec<EntityKey> = ["one", "two", "three"]
             .iter()
-            .map(|id| EntityKey::data("Scalar".to_owned(), String::from(*id)))
+            .map(|id| SCALAR_TYPE.parse_key(*id).unwrap())
             .collect();
 
         let entities_vec = vec![one, two, three];
@@ -655,11 +666,7 @@ fn update_many() {
             .iter()
             .map(|&id| {
                 layout
-                    .find(
-                        conn,
-                        &EntityKey::data(SCALAR.as_str(), id),
-                        BLOCK_NUMBER_MAX,
-                    )
+                    .find(conn, &SCALAR_TYPE.parse_key(id).unwrap(), BLOCK_NUMBER_MAX)
                     .unwrap_or_else(|_| panic!("Failed to read Scalar[{}]", id))
                     .unwrap()
             })
@@ -702,7 +709,7 @@ fn update_many() {
 #[test]
 fn serialize_bigdecimal() {
     run_test(|conn, layout| {
-        insert_entity(conn, layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
+        insert_entity(conn, layout, &*SCALAR_TYPE, vec![SCALAR_ENTITY.clone()]);
 
         // Update with overwrite
         let mut entity = SCALAR_ENTITY.clone();
@@ -711,8 +718,8 @@ fn serialize_bigdecimal() {
             let d = BigDecimal::from_str(d).unwrap();
             entity.set("bigDecimal", d).unwrap();
 
-            let key = EntityKey::data("Scalar".to_owned(), entity.id());
-            let entity_type = EntityType::from("Scalar");
+            let key = SCALAR_TYPE.key(entity.id());
+            let entity_type = layout.input_schema.entity_type("Scalar").unwrap();
             let entities = vec![(key, entity.clone())];
             let group = row_group_update(&entity_type, 0, entities);
             layout
@@ -722,7 +729,7 @@ fn serialize_bigdecimal() {
             let actual = layout
                 .find(
                     conn,
-                    &EntityKey::data(SCALAR.as_str(), "one"),
+                    &SCALAR_TYPE.parse_key("one").unwrap(),
                     BLOCK_NUMBER_MAX,
                 )
                 .expect("Failed to read Scalar[one]")
@@ -732,12 +739,12 @@ fn serialize_bigdecimal() {
     });
 }
 
-fn count_scalar_entities(conn: &PgConnection, layout: &Layout) -> usize {
+fn count_scalar_entities(conn: &mut PgConnection, layout: &Layout) -> usize {
     let filter = EntityFilter::Or(vec![
         EntityFilter::Equal("bool".into(), true.into()),
         EntityFilter::Equal("bool".into(), false.into()),
     ]);
-    let collection = EntityCollection::All(vec![(SCALAR.to_owned(), AttributeNames::All)]);
+    let collection = EntityCollection::All(vec![(SCALAR_TYPE.to_owned(), AttributeNames::All)]);
     let mut query = EntityQuery::new(layout.site.deployment.clone(), BLOCK_NUMBER_MAX, collection)
         .filter(filter);
     query.range.first = None;
@@ -751,14 +758,14 @@ fn count_scalar_entities(conn: &PgConnection, layout: &Layout) -> usize {
 #[test]
 fn delete() {
     run_test(|conn, layout| {
-        insert_entity(conn, layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
+        insert_entity(conn, layout, &*SCALAR_TYPE, vec![SCALAR_ENTITY.clone()]);
         let mut two = SCALAR_ENTITY.clone();
         two.set("id", "two").unwrap();
-        insert_entity(conn, layout, "Scalar", vec![two]);
+        insert_entity(conn, layout, &*SCALAR_TYPE, vec![two]);
 
         // Delete where nothing is getting deleted
-        let key = EntityKey::data("Scalar".to_owned(), "no such entity".to_owned());
-        let entity_type = EntityType::from("Scalar");
+        let key = SCALAR_TYPE.parse_key("no such entity").unwrap();
+        let entity_type = layout.input_schema.entity_type("Scalar").unwrap();
         let mut entity_keys = vec![key];
         let group = row_group_delete(&entity_type, 1, entity_keys.clone());
         let count = layout
@@ -770,7 +777,7 @@ fn delete() {
         // Delete entity two
         entity_keys
             .get_mut(0)
-            .map(|key| key.entity_id = Word::from("two"))
+            .map(|key| key.entity_id = SCALAR_TYPE.parse_id("two").unwrap())
             .expect("Failed to update key");
 
         let group = row_group_delete(&entity_type, 1, entity_keys);
@@ -790,18 +797,17 @@ fn insert_many_and_delete_many() {
         two.set("id", "two").unwrap();
         let mut three = SCALAR_ENTITY.clone();
         three.set("id", "three").unwrap();
-        insert_entity(conn, layout, "Scalar", vec![one, two, three]);
+        insert_entity(conn, layout, &*SCALAR_TYPE, vec![one, two, three]);
 
         // confidence test: there should be 3 scalar entities in store right now
         assert_eq!(3, count_scalar_entities(conn, layout));
 
         // Delete entities with ids equal to "two" and "three"
-        let entity_type = EntityType::from("Scalar");
         let entity_keys: Vec<_> = vec!["two", "three"]
             .into_iter()
-            .map(|key| EntityKey::data(entity_type.as_str(), key))
+            .map(|key| SCALAR_TYPE.parse_key(key).unwrap())
             .collect();
-        let group = row_group_delete(&entity_type, 1, entity_keys);
+        let group = row_group_delete(&*SCALAR_TYPE, 1, entity_keys);
         let num_removed = layout
             .delete(conn, &group, &MOCK_STOPWATCH)
             .expect("Failed to delete");
@@ -864,99 +870,115 @@ async fn layout_cache() {
 fn conflicting_entity() {
     // `id` is the id of an entity to create, `cat`, `dog`, and `ferret` are
     // the names of the types for which to check entity uniqueness
-    fn check(conn: &PgConnection, layout: &Layout, id: Value, cat: &str, dog: &str, ferret: &str) {
-        let cat = EntityType::from(cat);
-        let dog = EntityType::from(dog);
-        let ferret = EntityType::from(ferret);
+    fn check(
+        conn: &mut PgConnection,
+        layout: &Layout,
+        id: Value,
+        cat: &str,
+        dog: &str,
+        ferret: &str,
+    ) {
+        let conflicting =
+            |conn: &mut PgConnection, entity_type: &EntityType, types: Vec<&EntityType>| {
+                let fred = entity! { layout.input_schema => id: id.clone(), name: id.clone() };
+                let fred = Arc::new(fred);
+                let types: Vec<_> = types.into_iter().cloned().collect();
+                let mut group = RowGroup::new(entity_type.clone(), false);
+                group
+                    .push(
+                        EntityModification::Insert {
+                            key: entity_type.key(fred.id()),
+                            data: fred,
+                            block: 2,
+                            end: None,
+                        },
+                        2,
+                    )
+                    .unwrap();
+                layout.conflicting_entities(conn, &types, &group)
+            };
+
+        let cat_type = layout.input_schema.entity_type(cat).unwrap();
+        let dog_type = layout.input_schema.entity_type(dog).unwrap();
+        let ferret_type = layout.input_schema.entity_type(ferret).unwrap();
 
         let fred = entity! { layout.input_schema => id: id.clone(), name: id.clone() };
-        insert_entity(conn, layout, cat.as_str(), vec![fred]);
+        insert_entity(conn, layout, &cat_type, vec![fred]);
 
         // If we wanted to create Fred the dog, which is forbidden, we'd run this:
-        let conflict = layout
-            .conflicting_entity(conn, &id.to_string(), vec![cat.clone(), ferret.clone()])
-            .unwrap();
-        assert_eq!(Some(cat.to_string()), conflict);
+        let conflict = conflicting(conn, &dog_type, vec![&cat_type, &ferret_type]).unwrap();
+        assert_eq!(Some(cat.to_string()), conflict.map(|r| r.0));
 
         // If we wanted to manipulate Fred the cat, which is ok, we'd run:
-        let conflict = layout
-            .conflicting_entity(conn, &id.to_string(), vec![dog.clone(), ferret.clone()])
-            .unwrap();
+        let conflict = conflicting(conn, &cat_type, vec![&dog_type, &ferret_type]).unwrap();
         assert_eq!(None, conflict);
-
-        // Chairs are not pets
-        let chair = EntityType::from("Chair");
-        let result = layout.conflicting_entity(conn, &id.to_string(), vec![dog, ferret, chair]);
-        assert!(result.is_err());
-        assert_eq!("unknown table 'Chair'", result.err().unwrap().to_string());
     }
 
-    run_test(|conn, layout| {
+    run_test(|mut conn, layout| {
         let id = Value::String("fred".to_string());
-        check(conn, layout, id, "Cat", "Dog", "Ferret");
+        check(&mut conn, layout, id, "Cat", "Dog", "Ferret");
 
         let id = Value::Bytes(scalar::Bytes::from_str("0xf1ed").unwrap());
-        check(conn, layout, id, "ByteCat", "ByteDog", "ByteFerret");
+        check(&mut conn, layout, id, "ByteCat", "ByteDog", "ByteFerret");
     })
 }
 
 #[test]
 fn revert_block() {
-    fn check_fred(conn: &PgConnection, layout: &Layout) {
+    fn check_fred(conn: &mut PgConnection, layout: &Layout) {
         let id = "fred";
 
-        let set_fred = |name, block| {
+        let set_fred = |conn: &mut PgConnection, name, block| {
             let fred = entity! { layout.input_schema =>
                 id: id,
                 name: name
             };
             if block == 0 {
-                insert_entity_at(conn, layout, "Cat", vec![fred], block);
+                insert_entity_at(conn, layout, &*CAT_TYPE, vec![fred], block);
             } else {
-                update_entity_at(conn, layout, "Cat", vec![fred], block);
+                update_entity_at(conn, layout, &*CAT_TYPE, vec![fred], block);
             }
         };
 
-        let assert_fred = |name: &str| {
+        let assert_fred = |conn: &mut PgConnection, name: &str| {
             let fred = layout
-                .find(conn, &EntityKey::data("Cat", id), BLOCK_NUMBER_MAX)
+                .find(conn, &CAT_TYPE.parse_key(id).unwrap(), BLOCK_NUMBER_MAX)
                 .unwrap()
                 .expect("there's a fred");
             assert_eq!(name, fred.get("name").unwrap().as_str().unwrap())
         };
 
-        set_fred("zero", 0);
-        set_fred("one", 1);
-        set_fred("two", 2);
-        set_fred("three", 3);
+        set_fred(conn, "zero", 0);
+        set_fred(conn, "one", 1);
+        set_fred(conn, "two", 2);
+        set_fred(conn, "three", 3);
 
         layout.revert_block(conn, 3).unwrap();
-        assert_fred("two");
+        assert_fred(conn, "two");
         layout.revert_block(conn, 2).unwrap();
-        assert_fred("one");
+        assert_fred(conn, "one");
 
-        set_fred("three", 3);
-        assert_fred("three");
+        set_fred(conn, "three", 3);
+        assert_fred(conn, "three");
         layout.revert_block(conn, 3).unwrap();
-        assert_fred("one");
+        assert_fred(conn, "one");
     }
 
-    fn check_marty(conn: &PgConnection, layout: &Layout) {
-        let set_marties = |from, to| {
+    fn check_marty(conn: &mut PgConnection, layout: &Layout) {
+        let set_marties = |conn: &mut PgConnection, from, to| {
             for block in from..=to {
                 let id = format!("marty-{}", block);
                 let marty = entity! { layout.input_schema =>
                     id: id,
                     order: block,
                 };
-                insert_entity_at(conn, layout, "Mink", vec![marty], block);
+                insert_entity_at(conn, layout, &*MINK_TYPE, vec![marty], block);
             }
         };
 
-        let assert_marties = |max_block, except: Vec<BlockNumber>| {
+        let assert_marties = |conn: &mut PgConnection, max_block, except: Vec<BlockNumber>| {
             let id = DeploymentHash::new("QmXW3qvxV7zXnwRntpj7yoK8HZVtaraZ67uMqaLRvXdxha").unwrap();
-            let collection =
-                EntityCollection::All(vec![(EntityType::from("Mink"), AttributeNames::All)]);
+            let collection = EntityCollection::All(vec![(MINK_TYPE.clone(), AttributeNames::All)]);
             let filter = EntityFilter::StartsWith("id".to_string(), Value::from("marty"));
             let query = EntityQuery::new(id, BLOCK_NUMBER_MAX, collection)
                 .filter(filter)
@@ -980,22 +1002,23 @@ fn revert_block() {
             }
         };
 
-        let assert_all_marties = |max_block| assert_marties(max_block, vec![]);
+        let assert_all_marties =
+            |conn: &mut PgConnection, max_block| assert_marties(conn, max_block, vec![]);
 
-        set_marties(0, 4);
-        assert_all_marties(4);
+        set_marties(conn, 0, 4);
+        assert_all_marties(conn, 4);
 
         layout.revert_block(conn, 3).unwrap();
-        assert_all_marties(2);
+        assert_all_marties(conn, 2);
         layout.revert_block(conn, 2).unwrap();
-        assert_all_marties(1);
+        assert_all_marties(conn, 1);
 
-        set_marties(4, 4);
+        set_marties(conn, 4, 4);
         // We don't have entries for 2 and 3 anymore
-        assert_marties(4, vec![2, 3]);
+        assert_marties(conn, 4, vec![2, 3]);
 
         layout.revert_block(conn, 2).unwrap();
-        assert_all_marties(1);
+        assert_all_marties(conn, 1);
     }
 
     run_test(|conn, layout| {
@@ -1005,18 +1028,18 @@ fn revert_block() {
 }
 
 struct QueryChecker<'a> {
-    conn: &'a PgConnection,
+    conn: &'a mut PgConnection,
     layout: &'a Layout,
 }
 
 impl<'a> QueryChecker<'a> {
-    fn new(conn: &'a PgConnection, layout: &'a Layout) -> Self {
+    fn new(conn: &'a mut PgConnection, layout: &'a Layout) -> Self {
         insert_users(conn, layout);
         update_user_entity(
             conn,
             layout,
             "1",
-            "User",
+            &*USER_TYPE,
             "Jono",
             "achangedemail@email.com",
             67_i32,
@@ -1064,21 +1087,21 @@ impl<'a> QueryChecker<'a> {
     }
 }
 
-fn query(entity_types: Vec<&str>) -> EntityQuery {
+fn query(entity_types: &[&EntityType]) -> EntityQuery {
     EntityQuery::new(
         THINGS_SUBGRAPH_ID.clone(),
         BLOCK_NUMBER_MAX,
         EntityCollection::All(
             entity_types
                 .into_iter()
-                .map(|entity_type| (EntityType::from(entity_type), AttributeNames::All))
+                .map(|entity_type| ((*entity_type).clone(), AttributeNames::All))
                 .collect(),
         ),
     )
 }
 
 fn user_query() -> EntityQuery {
-    query(vec!["User"])
+    query(&vec![&*USER_TYPE])
 }
 
 trait EasyOrder {
@@ -1108,24 +1131,27 @@ impl EasyOrder for EntityQuery {
     expected = "layout.query failed to execute query: FulltextQueryInvalidSyntax(\"syntax error in tsquery: \\\"Jono 'a\\\"\")"
 )]
 fn check_fulltext_search_syntax_error() {
-    run_test(move |conn, layout| {
-        QueryChecker::new(conn, layout).check(
+    run_test(move |mut conn, layout| {
+        QueryChecker::new(&mut conn, layout).check(
             vec!["1"],
-            user_query().filter(EntityFilter::Equal("userSearch".into(), "Jono 'a".into())),
+            user_query().filter(EntityFilter::Fulltext(
+                "userSearch".into(),
+                "Jono 'a".into(),
+            )),
         );
     });
 }
 
 #[test]
 fn check_block_finds() {
-    run_test(move |conn, layout| {
-        let checker = QueryChecker::new(conn, layout);
+    run_test(move |mut conn, layout| {
+        let checker = QueryChecker::new(&mut conn, layout);
 
         update_user_entity(
-            conn,
+            checker.conn,
             layout,
             "1",
-            "User",
+            &*USER_TYPE,
             "Johnton",
             "tonofjohn@email.com",
             67_i32,
@@ -1158,43 +1184,49 @@ fn check_block_finds() {
 
 #[test]
 fn check_find() {
-    run_test(move |conn, layout| {
+    run_test(move |mut conn, layout| {
         // find with interfaces
-        let checker = QueryChecker::new(conn, layout)
-            .check(vec!["garfield", "pluto"], query(vec!["Cat", "Dog"]))
-            .check(
-                vec!["pluto", "garfield"],
-                query(vec!["Cat", "Dog"]).desc("name"),
-            )
+        let types = vec![&*CAT_TYPE, &*DOG_TYPE];
+        let checker = QueryChecker::new(&mut conn, layout)
+            .check(vec!["garfield", "pluto"], query(&types))
+            .check(vec!["pluto", "garfield"], query(&types).desc("name"))
             .check(
                 vec!["garfield"],
-                query(vec!["Cat", "Dog"])
+                query(&types)
                     .filter(EntityFilter::StartsWith("name".into(), Value::from("Gar")))
                     .desc("name"),
             )
-            .check(
-                vec!["pluto", "garfield"],
-                query(vec!["Cat", "Dog"]).desc("id"),
-            )
-            .check(
-                vec!["garfield", "pluto"],
-                query(vec!["Cat", "Dog"]).asc("id"),
-            )
-            .check(
-                vec!["garfield", "pluto"],
-                query(vec!["Cat", "Dog"]).unordered(),
-            );
+            .check(vec!["pluto", "garfield"], query(&types).desc("id"))
+            .check(vec!["garfield", "pluto"], query(&types).asc("id"))
+            .check(vec!["garfield", "pluto"], query(&types).unordered());
 
         // fulltext
         let checker = checker
             .check(
                 vec!["3"],
-                user_query().filter(EntityFilter::Equal("userSearch".into(), "Shaq:*".into())),
+                user_query().filter(EntityFilter::Fulltext("userSearch".into(), "Shaq:*".into())),
             )
             .check(
                 vec!["1"],
-                user_query().filter(EntityFilter::Equal(
+                user_query().filter(EntityFilter::Fulltext(
                     "userSearch".into(),
+                    "Jono & achangedemail@email.com".into(),
+                )),
+            );
+        // Test with a second fulltext search; we had a bug that caused only
+        // one search index to be populated (see issue #4794)
+        let checker = checker
+            .check(
+                vec!["3"],
+                user_query().filter(EntityFilter::Fulltext(
+                    "userSearch2".into(),
+                    "Shaq:*".into(),
+                )),
+            )
+            .check(
+                vec!["1"],
+                user_query().filter(EntityFilter::Fulltext(
+                    "userSearch2".into(),
                     "Jono & achangedemail@email.com".into(),
                 )),
             );
@@ -1664,26 +1696,26 @@ fn ferrets() -> (String, String, String, String) {
 }
 
 struct FilterChecker<'a> {
-    conn: &'a PgConnection,
+    conn: &'a mut PgConnection,
     layout: &'a Layout,
 }
 
 impl<'a> FilterChecker<'a> {
-    fn new(conn: &'a PgConnection, layout: &'a Layout) -> Self {
+    fn new(conn: &'a mut PgConnection, layout: &'a Layout) -> Self {
         let (a1, a2, a2b, a3) = ferrets();
-        insert_pet(conn, layout, "Ferret", "a1", &a1, 0);
-        insert_pet(conn, layout, "Ferret", "a2", &a2, 0);
-        insert_pet(conn, layout, "Ferret", "a2b", &a2b, 0);
-        insert_pet(conn, layout, "Ferret", "a3", &a3, 0);
+        insert_pet(conn, layout, &*FERRET_TYPE, "a1", &a1, 0);
+        insert_pet(conn, layout, &*FERRET_TYPE, "a2", &a2, 0);
+        insert_pet(conn, layout, &*FERRET_TYPE, "a2b", &a2b, 0);
+        insert_pet(conn, layout, &*FERRET_TYPE, "a3", &a3, 0);
 
         Self { conn, layout }
     }
 
-    fn check(&self, expected_entity_ids: Vec<&'static str>, filter: EntityFilter) -> &Self {
+    fn check(&mut self, expected_entity_ids: Vec<&'static str>, filter: EntityFilter) -> &mut Self {
         let expected_entity_ids: Vec<String> =
             expected_entity_ids.into_iter().map(str::to_owned).collect();
 
-        let query = query(vec!["Ferret"]).filter(filter).asc("id");
+        let query = query(&vec![&*FERRET_TYPE]).filter(filter).asc("id");
 
         let entities = self
             .layout
@@ -1758,7 +1790,7 @@ fn check_filters() {
     }
 
     run_test(move |conn, layout| {
-        let checker = FilterChecker::new(conn, layout);
+        let mut checker = FilterChecker::new(conn, layout);
 
         checker
             .check(vec!["a1"], filter_eq(&a1))
@@ -1813,9 +1845,9 @@ fn check_filters() {
             .check(vec!["a2", "a2b"], filter_not_in(vec![&a1, &a3]));
 
         update_entity_at(
-            conn,
+            checker.conn,
             layout,
-            "Ferret",
+            &*FERRET_TYPE,
             vec![entity! { layout.input_schema =>
               id: "a1",
               name: "Test"

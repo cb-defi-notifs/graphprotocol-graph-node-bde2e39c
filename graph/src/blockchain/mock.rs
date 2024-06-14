@@ -2,20 +2,21 @@ use crate::{
     components::{
         link_resolver::LinkResolver,
         store::{BlockNumber, DeploymentCursorTracker, DeploymentLocator},
+        subgraph::InstanceDSTemplateInfo,
     },
     data::subgraph::UnifiedMappingApiVersion,
-    prelude::DataSourceTemplateInfo,
+    prelude::{BlockHash, DataSourceTemplateInfo},
 };
 use anyhow::Error;
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{convert::TryFrom, sync::Arc};
+use std::{collections::HashSet, convert::TryFrom, sync::Arc};
 
 use super::{
     block_stream::{self, BlockStream, FirehoseCursor},
     client::ChainClient,
-    BlockIngestor, EmptyNodeCapabilities, HostFn, IngestorError, MappingTriggerTrait,
-    TriggerWithHandler,
+    BlockIngestor, BlockTime, EmptyNodeCapabilities, HostFn, IngestorError, MappingTriggerTrait,
+    NoopDecoderHook, TriggerWithHandler,
 };
 
 use super::{
@@ -40,6 +41,10 @@ impl Block for MockBlock {
     fn parent_ptr(&self) -> Option<BlockPtr> {
         todo!()
     }
+
+    fn timestamp(&self) -> BlockTime {
+        todo!()
+    }
 }
 
 #[derive(Clone)]
@@ -49,16 +54,19 @@ pub struct MockDataSource {
     pub network: Option<String>,
 }
 
-impl<C: Blockchain> TryFrom<DataSourceTemplateInfo<C>> for MockDataSource {
+impl TryFrom<DataSourceTemplateInfo> for MockDataSource {
     type Error = Error;
 
-    fn try_from(_value: DataSourceTemplateInfo<C>) -> Result<Self, Self::Error> {
+    fn try_from(_value: DataSourceTemplateInfo) -> Result<Self, Self::Error> {
         todo!()
     }
 }
 
 impl<C: Blockchain> DataSource<C> for MockDataSource {
-    fn from_template_info(_template_info: DataSourceTemplateInfo<C>) -> Result<Self, Error> {
+    fn from_template_info(
+        _info: InstanceDSTemplateInfo,
+        _template: &crate::data_source::DataSourceTemplate<C>,
+    ) -> Result<Self, Error> {
         todo!()
     }
 
@@ -67,6 +75,16 @@ impl<C: Blockchain> DataSource<C> for MockDataSource {
     }
 
     fn start_block(&self) -> crate::components::store::BlockNumber {
+        todo!()
+    }
+
+    fn handler_kinds(&self) -> HashSet<&str> {
+        vec!["mock_handler_1", "mock_handler_2"]
+            .into_iter()
+            .collect()
+    }
+
+    fn end_block(&self) -> Option<BlockNumber> {
         todo!()
     }
 
@@ -116,13 +134,13 @@ impl<C: Blockchain> DataSource<C> for MockDataSource {
     }
 
     fn from_stored_dynamic_data_source(
-        _template: &C::DataSourceTemplate,
+        _template: &<C as Blockchain>::DataSourceTemplate,
         _stored: crate::components::store::StoredDynamicDataSource,
     ) -> Result<Self, anyhow::Error> {
         todo!()
     }
 
-    fn validate(&self) -> Vec<anyhow::Error> {
+    fn validate(&self, _: &semver::Version) -> Vec<anyhow::Error> {
         todo!()
     }
 }
@@ -145,7 +163,13 @@ impl<C: Blockchain> UnresolvedDataSource<C> for MockUnresolvedDataSource {
 #[derive(Debug, Clone)]
 pub struct MockDataSourceTemplate;
 
-impl<C: Blockchain> DataSourceTemplate<C> for MockDataSourceTemplate {
+impl Into<DataSourceTemplateInfo> for MockDataSourceTemplate {
+    fn into(self) -> DataSourceTemplateInfo {
+        todo!()
+    }
+}
+
+impl DataSourceTemplate<MockBlockchain> for MockDataSourceTemplate {
     fn api_version(&self) -> semver::Version {
         todo!()
     }
@@ -163,6 +187,10 @@ impl<C: Blockchain> DataSourceTemplate<C> for MockDataSourceTemplate {
     }
 
     fn kind(&self) -> &str {
+        todo!()
+    }
+
+    fn info(&self) -> DataSourceTemplateInfo {
         todo!()
     }
 }
@@ -190,6 +218,7 @@ impl<C: Blockchain> TriggersAdapter<C> for MockTriggersAdapter {
         &self,
         _ptr: BlockPtr,
         _offset: BlockNumber,
+        _root: Option<BlockHash>,
     ) -> Result<Option<C::Block>, Error> {
         todo!()
     }
@@ -199,7 +228,7 @@ impl<C: Blockchain> TriggersAdapter<C> for MockTriggersAdapter {
         _from: crate::components::store::BlockNumber,
         _to: crate::components::store::BlockNumber,
         _filter: &C::TriggerFilter,
-    ) -> Result<Vec<block_stream::BlockWithTriggers<C>>, Error> {
+    ) -> Result<(Vec<block_stream::BlockWithTriggers<C>>, BlockNumber), Error> {
         todo!()
     }
 
@@ -297,6 +326,8 @@ impl Blockchain for MockBlockchain {
 
     type NodeCapabilities = EmptyNodeCapabilities<Self>;
 
+    type DecoderHook = NoopDecoderHook;
+
     fn triggers_adapter(
         &self,
         _loc: &crate::components::store::DeploymentLocator,
@@ -341,7 +372,7 @@ impl Blockchain for MockBlockchain {
         todo!()
     }
 
-    fn runtime_adapter(&self) -> std::sync::Arc<dyn RuntimeAdapter<Self>> {
+    fn runtime(&self) -> (std::sync::Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook) {
         todo!()
     }
 

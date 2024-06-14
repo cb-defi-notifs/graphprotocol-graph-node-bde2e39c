@@ -168,13 +168,21 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
         // Increment the frequency by 1
         let key_entry = CacheEntry::cache_key(key);
         self.queue
-            .change_priority_by(&key_entry, |(s, Reverse(f))| (s, Reverse(f + 1)));
+            .change_priority_by(&key_entry, |(_, Reverse(f))| {
+                *f += 1;
+            });
         self.accesses += 1;
         self.queue.get_mut(&key_entry).map(|x| {
             self.hits += 1;
             x.0.will_stale = false;
             x.0
         })
+    }
+
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (&K, &V)> {
+        self.queue
+            .iter()
+            .map(|entry| (&entry.0.key, &entry.0.value))
     }
 
     pub fn get(&mut self, key: &K) -> Option<&V> {

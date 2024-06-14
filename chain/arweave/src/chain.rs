@@ -3,13 +3,15 @@ use graph::blockchain::client::ChainClient;
 use graph::blockchain::firehose_block_ingestor::FirehoseBlockIngestor;
 use graph::blockchain::{
     BasicBlockchainBuilder, Block, BlockIngestor, BlockchainBuilder, BlockchainKind,
-    EmptyNodeCapabilities, NoopRuntimeAdapter,
+    EmptyNodeCapabilities, NoopDecoderHook, NoopRuntimeAdapter,
 };
 use graph::cheap_clone::CheapClone;
 use graph::components::store::DeploymentCursorTracker;
 use graph::data::subgraph::UnifiedMappingApiVersion;
+use graph::env::EnvVars;
 use graph::firehose::FirehoseEndpoint;
 use graph::prelude::MetricsRegistry;
+use graph::substreams::Clock;
 use graph::{
     blockchain::{
         block_stream::{
@@ -33,7 +35,9 @@ use crate::{
     codec,
     data_source::{DataSource, UnresolvedDataSource},
 };
-use graph::blockchain::block_stream::{BlockStream, FirehoseCursor};
+use graph::blockchain::block_stream::{
+    BlockStream, BlockStreamError, BlockStreamMapper, FirehoseCursor,
+};
 
 pub struct Chain {
     logger_factory: LoggerFactory,
@@ -50,7 +54,7 @@ impl std::fmt::Debug for Chain {
 }
 
 impl BlockchainBuilder<Chain> for BasicBlockchainBuilder {
-    fn build(self) -> Chain {
+    fn build(self, _config: &Arc<EnvVars>) -> Chain {
         Chain {
             logger_factory: self.logger_factory,
             name: self.name,
@@ -83,6 +87,8 @@ impl Blockchain for Chain {
     type TriggerFilter = crate::adapter::TriggerFilter;
 
     type NodeCapabilities = EmptyNodeCapabilities<Self>;
+
+    type DecoderHook = NoopDecoderHook;
 
     fn triggers_adapter(
         &self,
@@ -127,7 +133,7 @@ impl Blockchain for Chain {
             .subgraph_logger(&deployment)
             .new(o!("component" => "FirehoseBlockStream"));
 
-        let firehose_mapper = Arc::new(FirehoseMapper {});
+        let firehose_mapper = Arc::new(FirehoseMapper { adapter, filter });
 
         Ok(Box::new(FirehoseBlockStream::new(
             deployment.hash,
@@ -135,8 +141,6 @@ impl Blockchain for Chain {
             store.block_ptr(),
             store.firehose_cursor(),
             firehose_mapper,
-            adapter,
-            filter,
             start_blocks,
             logger,
             self.metrics_registry.clone(),
@@ -159,8 +163,8 @@ impl Blockchain for Chain {
             .map_err(Into::into)
     }
 
-    fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
-        Arc::new(NoopRuntimeAdapter::default())
+    fn runtime(&self) -> (Arc<dyn RuntimeAdapterTrait<Self>>, Self::DecoderHook) {
+        (Arc::new(NoopRuntimeAdapter::default()), NoopDecoderHook)
     }
 
     fn chain_client(&self) -> Arc<ChainClient<Self>> {
@@ -188,7 +192,7 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
         _from: BlockNumber,
         _to: BlockNumber,
         _filter: &TriggerFilter,
-    ) -> Result<Vec<BlockWithTriggers<Chain>>, Error> {
+    ) -> Result<(Vec<BlockWithTriggers<Chain>>, BlockNumber), Error> {
         panic!("Should never be called since not used by FirehoseBlockStream")
     }
 
@@ -237,6 +241,7 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
         &self,
         _ptr: BlockPtr,
         _offset: BlockNumber,
+        _root: Option<BlockHash>,
     ) -> Result<Option<codec::Block>, Error> {
         panic!("Should never be called since FirehoseBlockStream cannot resolve it")
     }
@@ -252,18 +257,62 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
     }
 }
 
-pub struct FirehoseMapper {}
+pub struct FirehoseMapper {
+    adapter: Arc<dyn TriggersAdapterTrait<Chain>>,
+    filter: Arc<TriggerFilter>,
+}
+
+#[async_trait]
+impl BlockStreamMapper<Chain> for FirehoseMapper {
+    fn decode_block(
+        &self,
+        output: Option<&[u8]>,
+    ) -> Result<Option<codec::Block>, BlockStreamError> {
+        let block = match output {
+            Some(block) => codec::Block::decode(block)?,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Arweave mapper is expected to always have a block"
+                ))?
+            }
+        };
+
+        Ok(Some(block))
+    }
+
+    async fn block_with_triggers(
+        &self,
+        logger: &Logger,
+        block: codec::Block,
+    ) -> Result<BlockWithTriggers<Chain>, BlockStreamError> {
+        self.adapter
+            .triggers_in_block(logger, block, self.filter.as_ref())
+            .await
+            .map_err(BlockStreamError::from)
+    }
+    async fn handle_substreams_block(
+        &self,
+        _logger: &Logger,
+        _clock: Clock,
+        _cursor: FirehoseCursor,
+        _block: Vec<u8>,
+    ) -> Result<BlockStreamEvent<Chain>, BlockStreamError> {
+        unimplemented!()
+    }
+}
 
 #[async_trait]
 impl FirehoseMapperTrait<Chain> for FirehoseMapper {
+    fn trigger_filter(&self) -> &TriggerFilter {
+        self.filter.as_ref()
+    }
+
     async fn to_block_stream_event(
         &self,
         logger: &Logger,
         response: &firehose::Response,
-        adapter: &Arc<dyn TriggersAdapterTrait<Chain>>,
-        filter: &TriggerFilter,
     ) -> Result<BlockStreamEvent<Chain>, FirehoseError> {
-        let step = ForkStep::from_i32(response.step).unwrap_or_else(|| {
+        let step = ForkStep::try_from(response.step).unwrap_or_else(|_| {
             panic!(
                 "unknown step i32 value {}, maybe you forgot update & re-regenerate the protobuf definitions?",
                 response.step
@@ -282,12 +331,18 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
         //
         // Check about adding basic information about the block in the bstream::BlockResponseV2 or maybe
         // define a slimmed down stuct that would decode only a few fields and ignore all the rest.
-        let block = codec::Block::decode(any_block.value.as_ref())?;
+        // unwrap: Input cannot be None so output will be error or block.
+        let block = self
+            .decode_block(Some(&any_block.value.as_ref()))
+            .map_err(Error::from)?
+            .unwrap();
 
         use ForkStep::*;
         match step {
             StepNew => Ok(BlockStreamEvent::ProcessBlock(
-                adapter.triggers_in_block(logger, block, filter).await?,
+                self.block_with_triggers(&logger, block)
+                    .await
+                    .map_err(Error::from)?,
                 FirehoseCursor::from(response.cursor.clone()),
             )),
 

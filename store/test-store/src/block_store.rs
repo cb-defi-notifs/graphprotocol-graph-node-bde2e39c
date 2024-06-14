@@ -1,5 +1,6 @@
 use std::{convert::TryFrom, str::FromStr, sync::Arc};
 
+use graph::blockchain::BlockTime;
 use lazy_static::lazy_static;
 
 use graph::components::store::BlockStore;
@@ -32,6 +33,11 @@ lazy_static! {
 
     pub static ref BLOCK_TWO: FakeBlock = BLOCK_ONE.make_child("f8ccbd3877eb98c958614f395dd351211afb9abba187bfc1fb4ac414b099c4a6", None);
     pub static ref BLOCK_TWO_NO_PARENT: FakeBlock = FakeBlock::make_no_parent(2, "3b652b00bff5e168b1218ff47593d516123261c4487629c4175f642ee56113fe");
+    pub static ref BLOCK_THREE_SKIPPED_2: FakeBlock = BLOCK_ONE.make_skipped_child(
+        "d8ccbd3877eb98c958614f395dd351211afb9abba187bfc1fb4ac414b099c4a6",
+        None,
+        1,
+    );
     pub static ref BLOCK_THREE: FakeBlock = BLOCK_TWO.make_child("7347afe69254df06729e123610b00b8b11f15cfae3241f9366fb113aec07489c", None);
     pub static ref BLOCK_THREE_NO_PARENT: FakeBlock = FakeBlock::make_no_parent(3, "fa9ebe3f74de4c56908b49f5c4044e85825f7350f3fa08a19151de82a82a7313");
     pub static ref BLOCK_THREE_TIMESTAMP: FakeBlock = BLOCK_TWO.make_child("6b834521bb753c132fdcf0e1034803ed9068e324112f8750ba93580b393a986b", Some(U256::from(1657712166)));
@@ -40,6 +46,8 @@ lazy_static! {
     // what you are doing, don't use this block for other tests.
     pub static ref BLOCK_THREE_NO_TIMESTAMP: FakeBlock = BLOCK_TWO.make_child("6b834521bb753c132fdcf0e1034803ed9068e324112f8750ba93580b393a986b", None);
     pub static ref BLOCK_FOUR: FakeBlock = BLOCK_THREE.make_child("7cce080f5a49c2997a6cc65fc1cee9910fd8fc3721b7010c0b5d0873e2ac785e", None);
+    pub static ref BLOCK_FOUR_SKIPPED_2_AND_3: FakeBlock = BLOCK_ONE.make_skipped_child("9cce080f5a49c2997a6cc65fc1cee9910fd8fc3721b7010c0b5d0873e2ac785e", None, 2);
+    pub static ref BLOCK_FIVE_AFTER_SKIP: FakeBlock = BLOCK_FOUR_SKIPPED_2_AND_3.make_child("8b0ea919e258eb2b119eb32de56b85d12d50ac6a9f7c5909f843d6172c8ba196", None);
     pub static ref BLOCK_FIVE: FakeBlock = BLOCK_FOUR.make_child("7b0ea919e258eb2b119eb32de56b85d12d50ac6a9f7c5909f843d6172c8ba196", None);
     pub static ref BLOCK_SIX_NO_PARENT: FakeBlock = FakeBlock::make_no_parent(6, "6b834521bb753c132fdcf0e1034803ed9068e324112f8750ba93580b393a986b");
 }
@@ -60,6 +68,15 @@ impl FakeBlock {
     pub fn make_child(&self, hash: &str, timestamp: Option<U256>) -> Self {
         FakeBlock {
             number: self.number + 1,
+            hash: hash.to_owned(),
+            parent_hash: self.hash.clone(),
+            timestamp,
+        }
+    }
+
+    pub fn make_skipped_child(&self, hash: &str, timestamp: Option<U256>, skip: i32) -> Self {
+        FakeBlock {
+            number: self.number + 1 + skip,
             hash: hash.to_owned(),
             parent_hash: self.hash.clone(),
             timestamp,
@@ -157,21 +174,26 @@ impl BlockchainBlock for FakeBlock {
 
         Ok(value)
     }
+
+    fn timestamp(&self) -> BlockTime {
+        BlockTime::NONE
+    }
 }
 
-pub type FakeBlockList<'a> = Vec<&'static FakeBlock>;
+pub type FakeBlockList = Vec<&'static FakeBlock>;
 
 /// Store the given chain as the blocks for the `network` set the
 /// network's genesis block to `genesis_hash`, and head block to
 /// `null`
-pub fn set_chain(chain: FakeBlockList, network: &str) {
+pub async fn set_chain(chain: FakeBlockList, network: &str) -> Vec<(BlockPtr, BlockHash)> {
     let store = crate::store::STORE
         .block_store()
         .chain_store(network)
         .unwrap();
-    let chain: Vec<&dyn BlockchainBlock> = chain
+    let chain: Vec<Arc<dyn BlockchainBlock>> = chain
         .iter()
-        .map(|block| *block as &dyn BlockchainBlock)
+        .cloned()
+        .map(|block| Arc::new(block.clone()) as Arc<dyn BlockchainBlock>)
         .collect();
-    store.set_chain(&GENESIS_BLOCK.hash, chain);
+    store.set_chain(&GENESIS_BLOCK.hash, chain).await
 }

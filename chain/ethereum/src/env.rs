@@ -46,6 +46,10 @@ pub struct EnvVars {
     /// Set by the environment variable `GRAPH_ETHEREUM_JSON_RPC_TIMEOUT`
     /// (expressed in seconds). The default value is 180s.
     pub json_rpc_timeout: Duration,
+
+    /// Set by the environment variable `GRAPH_ETHEREUM_BLOCK_RECEIPTS_TIMEOUT`
+    /// (expressed in seconds). The default value is 180s.
+    pub block_receipts_timeout: Duration,
     /// This is used for requests that will not fail the subgraph if the limit
     /// is reached, but will simply restart the syncing step, so it can be low.
     /// This limit guards against scenarios such as requesting a block hash that
@@ -80,9 +84,6 @@ pub struct EnvVars {
     /// Set by the flag `GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER`. The default value
     /// is 0.
     pub genesis_block_number: u64,
-    /// The time to wait between polls when using polling block ingestor.
-    /// The value is set in millis and the default is 1000.
-    pub ingestor_polling_interval: Duration,
     /// Set by the flag `GRAPH_ETH_CALL_NO_GAS`.
     /// This is a comma separated list of chain ids for which the gas field will not be set
     /// when calling `eth_call`.
@@ -117,6 +118,7 @@ impl From<Inner> for EnvVars {
             block_batch_size: x.block_batch_size,
             max_block_range_size: x.max_block_range_size,
             json_rpc_timeout: Duration::from_secs(x.json_rpc_timeout_in_secs),
+            block_receipts_timeout: Duration::from_secs(x.block_receipts_timeout_in_seccs),
             request_retries: x.request_retries,
             block_ingestor_max_concurrent_json_rpc_calls: x
                 .block_ingestor_max_concurrent_json_rpc_calls,
@@ -127,7 +129,6 @@ impl From<Inner> for EnvVars {
             cleanup_blocks: x.cleanup_blocks.0,
             target_triggers_per_block_range: x.target_triggers_per_block_range,
             genesis_block_number: x.genesis_block_number,
-            ingestor_polling_interval: Duration::from_millis(x.ingestor_polling_interval),
             eth_call_no_gas: x
                 .eth_call_no_gas
                 .split(',')
@@ -161,6 +162,8 @@ struct Inner {
     max_block_range_size: BlockNumber,
     #[envconfig(from = "GRAPH_ETHEREUM_JSON_RPC_TIMEOUT", default = "180")]
     json_rpc_timeout_in_secs: u64,
+    #[envconfig(from = "GRAPH_ETHEREUM_BLOCK_RECEIPTS_TIMEOUT", default = "10")]
+    block_receipts_timeout_in_seccs: u64,
     #[envconfig(from = "GRAPH_ETHEREUM_REQUEST_RETRIES", default = "10")]
     request_retries: usize,
     #[envconfig(
@@ -179,8 +182,6 @@ struct Inner {
     target_triggers_per_block_range: u64,
     #[envconfig(from = "GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER", default = "0")]
     genesis_block_number: u64,
-    #[envconfig(from = "ETHEREUM_POLLING_INTERVAL", default = "1000")]
-    ingestor_polling_interval: u64,
     #[envconfig(from = "GRAPH_ETH_CALL_NO_GAS", default = "421613")]
     eth_call_no_gas: String,
 }

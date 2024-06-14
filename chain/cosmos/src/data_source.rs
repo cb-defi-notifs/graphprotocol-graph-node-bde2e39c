@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Error, Result};
 
+use graph::components::subgraph::InstanceDSTemplateInfo;
 use graph::{
     blockchain::{self, Block, Blockchain, TriggerWithHandler},
     components::store::StoredDynamicDataSource,
     data::subgraph::DataSourceContext,
+    derive::CheapClone,
     prelude::{
-        anyhow, async_trait, BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, Link,
-        LinkResolver, Logger,
+        anyhow, async_trait, BlockNumber, CheapClone, Deserialize, Link, LinkResolver, Logger,
     },
 };
 
@@ -18,6 +19,10 @@ use crate::codec;
 use crate::trigger::CosmosTrigger;
 
 pub const COSMOS_KIND: &str = "cosmos";
+const BLOCK_HANDLER_KIND: &str = "block";
+const EVENT_HANDLER_KIND: &str = "event";
+const TRANSACTION_HANDLER_KIND: &str = "transaction";
+const MESSAGE_HANDLER_KIND: &str = "message";
 
 const DYNAMIC_DATA_SOURCE_ERROR: &str = "Cosmos subgraphs do not support dynamic data sources";
 const TEMPLATE_ERROR: &str = "Cosmos subgraphs do not support templates";
@@ -37,7 +42,10 @@ pub struct DataSource {
 }
 
 impl blockchain::DataSource<Chain> for DataSource {
-    fn from_template_info(_template_info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
+    fn from_template_info(
+        _info: InstanceDSTemplateInfo,
+        _template: &graph::data_source::DataSourceTemplate<Chain>,
+    ) -> Result<Self, Error> {
         Err(anyhow!(TEMPLATE_ERROR))
     }
 
@@ -47,6 +55,40 @@ impl blockchain::DataSource<Chain> for DataSource {
 
     fn start_block(&self) -> BlockNumber {
         self.source.start_block
+    }
+
+    fn handler_kinds(&self) -> HashSet<&str> {
+        let mut kinds = HashSet::new();
+
+        let Mapping {
+            block_handlers,
+            event_handlers,
+            transaction_handlers,
+            message_handlers,
+            ..
+        } = &self.mapping;
+
+        if !block_handlers.is_empty() {
+            kinds.insert(BLOCK_HANDLER_KIND);
+        }
+
+        if !event_handlers.is_empty() {
+            kinds.insert(EVENT_HANDLER_KIND);
+        }
+
+        if !transaction_handlers.is_empty() {
+            kinds.insert(TRANSACTION_HANDLER_KIND);
+        }
+
+        if !message_handlers.is_empty() {
+            kinds.insert(MESSAGE_HANDLER_KIND);
+        }
+
+        kinds
+    }
+
+    fn end_block(&self) -> Option<BlockNumber> {
+        self.source.end_block
     }
 
     fn match_and_decode(
@@ -89,6 +131,7 @@ impl blockchain::DataSource<Chain> for DataSource {
             trigger.cheap_clone(),
             handler,
             block.ptr(),
+            block.timestamp(),
         )))
     }
 
@@ -151,7 +194,7 @@ impl blockchain::DataSource<Chain> for DataSource {
         Err(anyhow!(DYNAMIC_DATA_SOURCE_ERROR))
     }
 
-    fn validate(&self) -> Vec<Error> {
+    fn validate(&self, _: &semver::Version) -> Vec<Error> {
         let mut errors = Vec::new();
 
         if self.kind != COSMOS_KIND {
@@ -468,12 +511,14 @@ pub struct MappingMessageHandler {
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Source {
-    #[serde(rename = "startBlock", default)]
+    #[serde(default)]
     pub start_block: BlockNumber,
+    pub(crate) end_block: Option<BlockNumber>,
 }
 
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, CheapClone, Debug, Hash, Eq, PartialEq, Deserialize)]
 pub enum EventOrigin {
     BeginBlock,
     DeliverTx,
@@ -511,7 +556,7 @@ fn duplicate_url_type(message: &str) -> Error {
 mod tests {
     use super::*;
 
-    use graph::blockchain::DataSource as _;
+    use graph::{blockchain::DataSource as _, data::subgraph::LATEST_VERSION};
 
     #[test]
     fn test_event_handlers_origin_validation() {
@@ -553,7 +598,7 @@ mod tests {
         ];
 
         for (data_source, errors) in &cases {
-            let validation_errors = data_source.validate();
+            let validation_errors = data_source.validate(&LATEST_VERSION);
 
             assert_eq!(errors.len(), validation_errors.len());
 
@@ -601,7 +646,7 @@ mod tests {
         ];
 
         for (data_source, errors) in &cases {
-            let validation_errors = data_source.validate();
+            let validation_errors = data_source.validate(&LATEST_VERSION);
 
             assert_eq!(errors.len(), validation_errors.len());
 
@@ -623,7 +668,10 @@ mod tests {
                 kind: "cosmos".to_string(),
                 network: None,
                 name: "Test".to_string(),
-                source: Source { start_block: 1 },
+                source: Source {
+                    start_block: 1,
+                    end_block: None,
+                },
                 mapping: Mapping {
                     api_version: semver::Version::new(0, 0, 0),
                     language: "".to_string(),
@@ -645,7 +693,10 @@ mod tests {
                 kind: "cosmos".to_string(),
                 network: None,
                 name: "Test".to_string(),
-                source: Source { start_block: 1 },
+                source: Source {
+                    start_block: 1,
+                    end_block: None,
+                },
                 mapping: Mapping {
                     api_version: semver::Version::new(0, 0, 0),
                     language: "".to_string(),

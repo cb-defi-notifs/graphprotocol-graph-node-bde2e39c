@@ -1,37 +1,62 @@
 use anyhow::{anyhow, Error};
 use anyhow::{ensure, Context};
-use graph::blockchain::TriggerWithHandler;
-use graph::components::store::StoredDynamicDataSource;
+use graph::blockchain::{BlockPtr, TriggerWithHandler};
+use graph::components::metrics::subgraph::SubgraphInstanceMetrics;
+use graph::components::store::{EthereumCallCache, StoredDynamicDataSource};
+use graph::components::subgraph::{HostMetrics, InstanceDSTemplateInfo, MappingError};
+use graph::components::trigger_processor::RunnableTriggers;
+use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
+use graph::env::ENV_VARS;
+use graph::futures03::future::try_join;
+use graph::futures03::stream::FuturesOrdered;
+use graph::futures03::TryStreamExt;
 use graph::prelude::ethabi::ethereum_types::H160;
-use graph::prelude::ethabi::StateMutability;
-use graph::prelude::futures03::future::try_join;
-use graph::prelude::futures03::stream::FuturesOrdered;
+use graph::prelude::ethabi::{StateMutability, Token};
+use graph::prelude::lazy_static;
+use graph::prelude::regex::Regex;
 use graph::prelude::{Link, SubgraphManifestValidationError};
-use graph::slog::{o, trace};
+use graph::slog::{debug, error, o, trace};
+use itertools::Itertools;
+use serde::de;
+use serde::de::Error as ErrorD;
+use serde::{Deserialize, Deserializer};
+use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tiny_keccak::{keccak256, Keccak};
 
 use graph::{
     blockchain::{self, Blockchain},
+    derive::CheapClone,
     prelude::{
         async_trait,
         ethabi::{Address, Contract, Event, Function, LogParam, ParamType, RawLog},
         serde_json, warn,
         web3::types::{Log, Transaction, H256},
-        BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, EthereumCall,
-        LightEthereumBlock, LightEthereumBlockExt, LinkResolver, Logger, TryStreamExt,
+        BlockNumber, CheapClone, EthereumCall, LightEthereumBlock, LightEthereumBlockExt,
+        LinkResolver, Logger,
     },
 };
 
-use graph::data::subgraph::{calls_host_fn, DataSourceContext, Source};
+use graph::data::subgraph::{
+    calls_host_fn, DataSourceContext, Source, MIN_SPEC_VERSION, SPEC_VERSION_0_0_8,
+    SPEC_VERSION_1_2_0,
+};
 
+use crate::adapter::EthereumAdapter as _;
 use crate::chain::Chain;
+use crate::network::EthereumNetworkAdapters;
 use crate::trigger::{EthereumBlockTriggerType, EthereumTrigger, MappingTrigger};
+use crate::{ContractCall, NodeCapabilities};
 
 // The recommended kind is `ethereum`, `ethereum/contract` is accepted for backwards compatibility.
 const ETHEREUM_KINDS: &[&str] = &["ethereum/contract", "ethereum"];
+const EVENT_HANDLER_KIND: &str = "event";
+const CALL_HANDLER_KIND: &str = "call";
+const BLOCK_HANDLER_KIND: &str = "block";
 
 /// Runtime representation of a data source.
 // Note: Not great for memory usage that this needs to be `Clone`, considering how there may be tens
@@ -44,6 +69,7 @@ pub struct DataSource {
     pub manifest_idx: u32,
     pub address: Option<Address>,
     pub start_block: BlockNumber,
+    pub end_block: Option<BlockNumber>,
     pub mapping: Mapping,
     pub context: Arc<Option<DataSourceContext>>,
     pub creation_block: Option<BlockNumber>,
@@ -51,14 +77,20 @@ pub struct DataSource {
 }
 
 impl blockchain::DataSource<Chain> for DataSource {
-    fn from_template_info(info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
-        let DataSourceTemplateInfo {
-            template,
+    fn from_template_info(
+        info: InstanceDSTemplateInfo,
+        ds_template: &graph::data_source::DataSourceTemplate<Chain>,
+    ) -> Result<Self, Error> {
+        // Note: There clearly is duplication between the data in `ds_template and the `template`
+        // field here. Both represent a template definition, would be good to unify them.
+        let InstanceDSTemplateInfo {
+            template: _,
             params,
             context,
             creation_block,
         } = info;
-        let template = template.into_onchain().ok_or(anyhow!(
+
+        let template = ds_template.as_onchain().ok_or(anyhow!(
             "Cannot create onchain data source from offchain template"
         ))?;
 
@@ -86,13 +118,14 @@ impl blockchain::DataSource<Chain> for DataSource {
             .with_context(|| format!("template `{}`", template.name))?;
 
         Ok(DataSource {
-            kind: template.kind,
-            network: template.network,
-            name: template.name,
+            kind: template.kind.clone(),
+            network: template.network.clone(),
+            name: template.name.clone(),
             manifest_idx: template.manifest_idx,
             address: Some(address),
-            start_block: 0,
-            mapping: template.mapping,
+            start_block: creation_block,
+            end_block: None,
+            mapping: template.mapping.clone(),
             context: Arc::new(context),
             creation_block: Some(creation_block),
             contract_abi,
@@ -103,8 +136,35 @@ impl blockchain::DataSource<Chain> for DataSource {
         self.address.as_ref().map(|x| x.as_bytes())
     }
 
+    fn handler_kinds(&self) -> HashSet<&str> {
+        let mut kinds = HashSet::new();
+
+        let Mapping {
+            event_handlers,
+            call_handlers,
+            block_handlers,
+            ..
+        } = &self.mapping;
+
+        if !event_handlers.is_empty() {
+            kinds.insert(EVENT_HANDLER_KIND);
+        }
+        if !call_handlers.is_empty() {
+            kinds.insert(CALL_HANDLER_KIND);
+        }
+        for handler in block_handlers.iter() {
+            kinds.insert(handler.kind());
+        }
+
+        kinds
+    }
+
     fn start_block(&self) -> BlockNumber {
         self.start_block
+    }
+
+    fn end_block(&self) -> Option<BlockNumber> {
+        self.end_block
     }
 
     fn match_and_decode(
@@ -146,12 +206,12 @@ impl blockchain::DataSource<Chain> for DataSource {
             address,
             mapping,
             context,
-
             // The creation block is ignored for detection duplicate data sources.
             // Contract ABI equality is implicit in `mapping.abis` equality.
             creation_block: _,
             contract_abi: _,
             start_block: _,
+            end_block: _,
         } = self;
 
         // mapping_request_sender, host_metrics, and (most of) host_exports are operational structs
@@ -216,7 +276,8 @@ impl blockchain::DataSource<Chain> for DataSource {
             name: template.name.clone(),
             manifest_idx,
             address,
-            start_block: 0,
+            start_block: creation_block.unwrap_or(0),
+            end_block: None,
             mapping: template.mapping.clone(),
             context: Arc::new(context),
             creation_block,
@@ -224,7 +285,7 @@ impl blockchain::DataSource<Chain> for DataSource {
         })
     }
 
-    fn validate(&self) -> Vec<Error> {
+    fn validate(&self, spec_version: &semver::Version) -> Vec<Error> {
         let mut errors = vec![];
 
         if !ETHEREUM_KINDS.contains(&self.kind.as_str()) {
@@ -242,23 +303,50 @@ impl blockchain::DataSource<Chain> for DataSource {
             errors.push(SubgraphManifestValidationError::SourceAddressRequired.into());
         };
 
-        // Validate that there are no more than one of each type of block_handler
-        let has_too_many_block_handlers = {
-            let mut non_filtered_block_handler_count = 0;
-            let mut call_filtered_block_handler_count = 0;
-            self.mapping
-                .block_handlers
-                .iter()
-                .for_each(|block_handler| {
-                    if block_handler.filter.is_none() {
-                        non_filtered_block_handler_count += 1
-                    } else {
-                        call_filtered_block_handler_count += 1
-                    }
-                });
-            non_filtered_block_handler_count > 1 || call_filtered_block_handler_count > 1
-        };
-        if has_too_many_block_handlers {
+        // Ensure that there is at most one instance of each type of block handler
+        // and that a combination of a non-filtered block handler and a filtered block handler is not allowed.
+
+        let mut non_filtered_block_handler_count = 0;
+        let mut call_filtered_block_handler_count = 0;
+        let mut polling_filtered_block_handler_count = 0;
+        let mut initialization_handler_count = 0;
+        self.mapping
+            .block_handlers
+            .iter()
+            .for_each(|block_handler| {
+                match block_handler.filter {
+                    None => non_filtered_block_handler_count += 1,
+                    Some(ref filter) => match filter {
+                        BlockHandlerFilter::Call => call_filtered_block_handler_count += 1,
+                        BlockHandlerFilter::Once => initialization_handler_count += 1,
+                        BlockHandlerFilter::Polling { every: _ } => {
+                            polling_filtered_block_handler_count += 1
+                        }
+                    },
+                };
+            });
+
+        let has_non_filtered_block_handler = non_filtered_block_handler_count > 0;
+        // If there is a non-filtered block handler, we need to check if there are any
+        // filtered block handlers except for the ones with call filter
+        // If there are, we do not allow that combination
+        let has_restricted_filtered_and_non_filtered_combination = has_non_filtered_block_handler
+            && (polling_filtered_block_handler_count > 0 || initialization_handler_count > 0);
+
+        if has_restricted_filtered_and_non_filtered_combination {
+            errors.push(anyhow!(
+                "data source has a combination of filtered and non-filtered block handlers that is not allowed"
+            ));
+        }
+
+        // Check the number of handlers for each type
+        // If there is more than one of any type, we have too many handlers
+        let has_too_many = non_filtered_block_handler_count > 1
+            || call_filtered_block_handler_count > 1
+            || initialization_handler_count > 1
+            || polling_filtered_block_handler_count > 1;
+
+        if has_too_many {
             errors.push(anyhow!("data source has duplicated block handlers"));
         }
 
@@ -276,11 +364,59 @@ impl blockchain::DataSource<Chain> for DataSource {
             }
         }
 
+        if spec_version < &SPEC_VERSION_1_2_0 {
+            for handler in &self.mapping.event_handlers {
+                if !handler.calls.decls.is_empty() {
+                    errors.push(anyhow!(
+                        "handler {}: declaring eth calls on handlers is only supported for specVersion >= 1.2.0", handler.event
+                    ));
+                    break;
+                }
+            }
+        }
+
+        for handler in &self.mapping.event_handlers {
+            for call in handler.calls.decls.as_ref() {
+                match self.mapping.find_abi(&call.expr.abi) {
+                    // TODO: Handle overloaded functions by passing a signature
+                    Ok(abi) => match abi.function(&call.expr.abi, &call.expr.func, None) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            errors.push(e);
+                        }
+                    },
+                    Err(e) => {
+                        errors.push(e);
+                    }
+                }
+            }
+        }
         errors
     }
 
     fn api_version(&self) -> semver::Version {
         self.mapping.api_version.clone()
+    }
+
+    fn min_spec_version(&self) -> semver::Version {
+        let mut min_version = MIN_SPEC_VERSION;
+
+        for handler in &self.mapping.block_handlers {
+            match handler.filter {
+                Some(BlockHandlerFilter::Polling { every: _ }) | Some(BlockHandlerFilter::Once) => {
+                    min_version = std::cmp::max(min_version, SPEC_VERSION_0_0_8);
+                }
+                _ => {}
+            }
+        }
+
+        for handler in &self.mapping.event_handlers {
+            if handler.has_additional_topics() {
+                min_version = std::cmp::max(min_version, SPEC_VERSION_1_2_0);
+            }
+        }
+
+        min_version
     }
 
     fn runtime(&self) -> Option<Arc<Vec<u8>>> {
@@ -311,6 +447,7 @@ impl DataSource {
             manifest_idx,
             address: source.address,
             start_block: source.start_block,
+            end_block: source.end_block,
             mapping,
             context: Arc::new(context),
             creation_block,
@@ -318,22 +455,16 @@ impl DataSource {
         })
     }
 
-    fn handlers_for_log(&self, log: &Log) -> Result<Vec<MappingEventHandler>, Error> {
-        // Get signature from the log
-        let topic0 = log.topics.get(0).context("Ethereum event has no topics")?;
-
-        let handlers = self
-            .mapping
+    fn handlers_for_log(&self, log: &Log) -> Vec<MappingEventHandler> {
+        self.mapping
             .event_handlers
             .iter()
-            .filter(|handler| *topic0 == handler.topic0())
+            .filter(|handler| handler.matches(&log))
             .cloned()
-            .collect::<Vec<_>>();
-
-        Ok(handlers)
+            .collect::<Vec<_>>()
     }
 
-    fn handler_for_call(&self, call: &EthereumCall) -> Result<Option<MappingCallHandler>, Error> {
+    fn handler_for_call(&self, call: &EthereumCall) -> Result<Option<&MappingCallHandler>, Error> {
         // First four bytes of the input for the call are the first four
         // bytes of hash of the function signature
         ensure!(
@@ -343,35 +474,49 @@ impl DataSource {
 
         let target_method_id = &call.input.0[..4];
 
-        Ok(self
-            .mapping
-            .call_handlers
-            .iter()
-            .find(move |handler| {
-                let fhash = keccak256(handler.function.as_bytes());
-                let actual_method_id = [fhash[0], fhash[1], fhash[2], fhash[3]];
-                target_method_id == actual_method_id
-            })
-            .cloned())
+        Ok(self.mapping.call_handlers.iter().find(move |handler| {
+            let fhash = keccak256(handler.function.as_bytes());
+            let actual_method_id = [fhash[0], fhash[1], fhash[2], fhash[3]];
+            target_method_id == actual_method_id
+        }))
     }
 
     fn handler_for_block(
         &self,
         trigger_type: &EthereumBlockTriggerType,
-    ) -> Option<MappingBlockHandler> {
+        block: BlockNumber,
+    ) -> Option<&MappingBlockHandler> {
         match trigger_type {
-            EthereumBlockTriggerType::Every => self
-                .mapping
-                .block_handlers
-                .iter()
-                .find(move |handler| handler.filter.is_none())
-                .cloned(),
+            // Start matches only initialization handlers with a `once` filter
+            EthereumBlockTriggerType::Start => {
+                self.mapping
+                    .block_handlers
+                    .iter()
+                    .find(move |handler| match handler.filter {
+                        Some(BlockHandlerFilter::Once) => block == self.start_block,
+                        _ => false,
+                    })
+            }
+            // End matches all handlers without a filter or with a `polling` filter
+            EthereumBlockTriggerType::End => {
+                self.mapping
+                    .block_handlers
+                    .iter()
+                    .find(move |handler| match handler.filter {
+                        Some(BlockHandlerFilter::Polling { every }) => {
+                            let start_block = self.start_block;
+                            let should_trigger = (block - start_block) % every.get() as i32 == 0;
+                            should_trigger
+                        }
+                        None => true,
+                        _ => false,
+                    })
+            }
             EthereumBlockTriggerType::WithCallTo(_address) => self
                 .mapping
                 .block_handlers
                 .iter()
-                .find(move |handler| handler.filter == Some(BlockHandlerFilter::Call))
-                .cloned(),
+                .find(move |handler| handler.filter == Some(BlockHandlerFilter::Call)),
         }
     }
 
@@ -506,11 +651,11 @@ impl DataSource {
     fn matches_trigger_address(&self, trigger: &EthereumTrigger) -> bool {
         let Some(ds_address) = self.address else {
             // 'wildcard' data sources match any trigger address.
-            return true
+            return true;
         };
 
         let Some(trigger_address) = trigger.address() else {
-             return true
+            return true;
         };
 
         ds_address == *trigger_address
@@ -534,7 +679,7 @@ impl DataSource {
 
         match trigger {
             EthereumTrigger::Block(_, trigger_type) => {
-                let handler = match self.handler_for_block(trigger_type) {
+                let handler = match self.handler_for_block(trigger_type, block.number()) {
                     Some(handler) => handler,
                     None => return Ok(None),
                 };
@@ -542,12 +687,15 @@ impl DataSource {
                     MappingTrigger::Block {
                         block: block.cheap_clone(),
                     },
-                    handler.handler,
+                    handler.handler.clone(),
                     block.block_ptr(),
+                    block.timestamp(),
                 )))
             }
-            EthereumTrigger::Log(log, receipt) => {
-                let potential_handlers = self.handlers_for_log(log)?;
+            EthereumTrigger::Log(log_ref) => {
+                let log = Arc::new(log_ref.log().clone());
+                let receipt = log_ref.receipt();
+                let potential_handlers = self.handlers_for_log(&log);
 
                 // Map event handlers to (event handler, event ABI) pairs; fail if there are
                 // handlers that don't exist in the contract ABI
@@ -620,12 +768,11 @@ impl DataSource {
                 // associated transaction and instead have `transaction_hash == block.hash`,
                 // in which case we pass a dummy transaction to the mappings.
                 // See also ca0edc58-0ec5-4c89-a7dd-2241797f5e50.
-                let transaction = if log.transaction_hash != block.hash {
-                    block
-                        .transaction_for_log(log)
-                        .context("Found no transaction for event")?
-                } else {
-                    // Infer some fields from the log and fill the rest with zeros.
+                // There is another special case in zkSync-era, where the transaction hash in this case would be zero
+                // See https://docs.zksync.io/zk-stack/concepts/blocks.html#fictive-l2-block-finalizing-the-batch
+                let transaction = if log.transaction_hash == block.hash
+                    || log.transaction_hash == Some(H256::zero())
+                {
                     Transaction {
                         hash: log.transaction_hash.unwrap(),
                         block_hash: block.hash,
@@ -634,6 +781,12 @@ impl DataSource {
                         from: Some(H160::zero()),
                         ..Transaction::default()
                     }
+                } else {
+                    // This is the general case where the log's transaction hash does not match the block's hash
+                    // and is not a special zero hash, implying a real transaction associated with this log.
+                    block
+                        .transaction_for_log(&log)
+                        .context("Found no transaction for event")?
                 };
 
                 let logging_extras = Arc::new(o! {
@@ -641,16 +794,20 @@ impl DataSource {
                     "address" => format!("{}", &log.address),
                     "transaction" => format!("{}", &transaction.hash),
                 });
+                let handler = event_handler.handler.clone();
+                let calls = DeclaredCall::new(&self.mapping, &event_handler, &log, &params)?;
                 Ok(Some(TriggerWithHandler::<Chain>::new_with_logging_extras(
                     MappingTrigger::Log {
                         block: block.cheap_clone(),
                         transaction: Arc::new(transaction),
-                        log: log.cheap_clone(),
+                        log,
                         params,
-                        receipt: receipt.clone(),
+                        receipt: receipt.map(|r| r.cheap_clone()),
+                        calls,
                     },
-                    event_handler.handler,
+                    handler,
                     block.block_ptr(),
+                    block.timestamp(),
                     logging_extras,
                 )))
             }
@@ -759,12 +916,296 @@ impl DataSource {
                         inputs,
                         outputs,
                     },
-                    handler.handler,
+                    handler.handler.clone(),
                     block.block_ptr(),
+                    block.timestamp(),
                     logging_extras,
                 )))
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeclaredCall {
+    /// The user-supplied label from the manifest
+    label: String,
+    contract_name: String,
+    address: Address,
+    function: Function,
+    args: Vec<Token>,
+}
+
+impl DeclaredCall {
+    fn new(
+        mapping: &Mapping,
+        handler: &MappingEventHandler,
+        log: &Log,
+        params: &[LogParam],
+    ) -> Result<Vec<DeclaredCall>, anyhow::Error> {
+        let mut calls = Vec::new();
+        for decl in handler.calls.decls.iter() {
+            let contract_name = decl.expr.abi.to_string();
+            let function_name = decl.expr.func.as_str();
+            // Obtain the path to the contract ABI
+            let abi = mapping.find_abi(&contract_name)?;
+            // TODO: Handle overloaded functions
+            let function = {
+                // Behavior for apiVersion < 0.0.4: look up function by name; for overloaded
+                // functions this always picks the same overloaded variant, which is incorrect
+                // and may lead to encoding/decoding errors
+                abi.contract.function(function_name).with_context(|| {
+                    format!(
+                        "Unknown function \"{}::{}\" called from WASM runtime",
+                        contract_name, function_name
+                    )
+                })?
+            };
+
+            let address = decl.address(log, params)?;
+            let args = decl.args(log, params)?;
+
+            let call = DeclaredCall {
+                label: decl.label.clone(),
+                contract_name,
+                address,
+                function: function.clone(),
+                args,
+            };
+            calls.push(call);
+        }
+
+        Ok(calls)
+    }
+
+    fn as_eth_call(self, block_ptr: BlockPtr, gas: Option<u32>) -> (ContractCall, String) {
+        (
+            ContractCall {
+                contract_name: self.contract_name,
+                address: self.address,
+                block_ptr,
+                function: self.function,
+                args: self.args,
+                gas,
+            },
+            self.label,
+        )
+    }
+}
+
+pub struct DecoderHook {
+    eth_adapters: Arc<EthereumNetworkAdapters>,
+    call_cache: Arc<dyn EthereumCallCache>,
+    eth_call_gas: Option<u32>,
+}
+
+impl DecoderHook {
+    pub fn new(
+        eth_adapters: Arc<EthereumNetworkAdapters>,
+        call_cache: Arc<dyn EthereumCallCache>,
+        eth_call_gas: Option<u32>,
+    ) -> Self {
+        Self {
+            eth_adapters,
+            call_cache,
+            eth_call_gas,
+        }
+    }
+}
+
+impl DecoderHook {
+    /// Perform a batch of eth_calls, observing the execution time of each
+    /// call. Returns a list of the call labels for which we received a
+    /// `None` response, indicating a revert
+    async fn eth_calls(
+        &self,
+        logger: &Logger,
+        block_ptr: &BlockPtr,
+        calls_and_metrics: Vec<(Arc<HostMetrics>, DeclaredCall)>,
+    ) -> Result<Vec<String>, MappingError> {
+        // This check is not just to speed things up, but is also needed to
+        // make sure the runner tests don't fail; they don't have declared
+        // eth calls, but without this check we try to get an eth adapter
+        // even when there are no calls, which fails in the runner test
+        // setup
+        if calls_and_metrics.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let start = Instant::now();
+
+        let (metrics, calls): (Vec<_>, Vec<_>) = calls_and_metrics.into_iter().unzip();
+
+        let (calls, labels): (Vec<_>, Vec<_>) = calls
+            .into_iter()
+            .map(|call| call.as_eth_call(block_ptr.clone(), self.eth_call_gas))
+            .unzip();
+
+        let eth_adapter = self.eth_adapters.call_or_cheapest(Some(&NodeCapabilities {
+            archive: true,
+            traces: false,
+        }))?;
+
+        let call_refs = calls.iter().collect::<Vec<_>>();
+        let results = eth_adapter
+            .contract_calls(logger, &call_refs, self.call_cache.cheap_clone())
+            .await
+            .map_err(|e| {
+                // An error happened, everybody gets charged
+                let elapsed = start.elapsed().as_secs_f64() / call_refs.len() as f64;
+                for (metrics, call) in metrics.iter().zip(call_refs) {
+                    metrics.observe_eth_call_execution_time(
+                        elapsed,
+                        &call.contract_name,
+                        &call.function.name,
+                    );
+                }
+                MappingError::from(e)
+            })?;
+
+        // We don't have time measurements for each call (though that would be nice)
+        // Use the average time of all calls that we want to observe as the time for
+        // each call
+        let to_observe = results.iter().map(|(_, source)| source.observe()).count() as f64;
+        let elapsed = start.elapsed().as_secs_f64() / to_observe;
+
+        results
+            .iter()
+            .zip(metrics)
+            .zip(calls)
+            .for_each(|(((_, source), metrics), call)| {
+                if source.observe() {
+                    metrics.observe_eth_call_execution_time(
+                        elapsed,
+                        &call.contract_name,
+                        &call.function.name,
+                    );
+                }
+            });
+
+        let labels = results
+            .iter()
+            .zip(labels)
+            .filter_map(|((res, _), label)| if res.is_none() { Some(label) } else { None })
+            .map(|s| s.to_string())
+            .collect();
+        Ok(labels)
+    }
+}
+
+#[async_trait]
+impl blockchain::DecoderHook<Chain> for DecoderHook {
+    async fn after_decode<'a>(
+        &self,
+        logger: &Logger,
+        block_ptr: &BlockPtr,
+        runnables: Vec<RunnableTriggers<'a, Chain>>,
+        metrics: &Arc<SubgraphInstanceMetrics>,
+    ) -> Result<Vec<RunnableTriggers<'a, Chain>>, MappingError> {
+        /// Log information about failed eth calls. 'Failure' here simply
+        /// means that the call was reverted; outright errors lead to a real
+        /// error. For reverted calls, `self.eth_calls` returns the label
+        /// from the manifest for that call.
+        ///
+        /// One reason why declared calls can fail is if they are attached
+        /// to the wrong handler, or if arguments are specified incorrectly.
+        /// Calls that revert every once in a while might be ok and what the
+        /// user intended, but we want to clearly log so that users can spot
+        /// mistakes in their manifest, which will lead to unnecessary eth
+        /// calls
+        fn log_results(
+            logger: &Logger,
+            failures: &[String],
+            calls_count: usize,
+            trigger_count: usize,
+            elapsed: Duration,
+        ) {
+            let fail_count = failures.len();
+
+            if fail_count > 0 {
+                let mut counts: Vec<_> = failures.iter().counts().into_iter().collect();
+                counts.sort_by_key(|(label, _)| *label);
+                let counts = counts
+                    .into_iter()
+                    .map(|(label, count)| {
+                        let times = if count == 1 { "time" } else { "times" };
+                        format!("{label} ({count} {times})")
+                    })
+                    .join(", ");
+                error!(logger, "Declared calls failed";
+                  "triggers" => trigger_count,
+                  "calls_count" => calls_count,
+                  "fail_count" => fail_count,
+                  "calls_ms" => elapsed.as_millis(),
+                  "failures" => format!("[{}]", counts));
+            } else {
+                debug!(logger, "Declared calls";
+                  "triggers" => trigger_count,
+                  "calls_count" => calls_count,
+                  "calls_ms" => elapsed.as_millis());
+            }
+        }
+
+        if ENV_VARS.mappings.disable_declared_calls {
+            return Ok(runnables);
+        }
+
+        let _section = metrics.stopwatch.start_section("declared_ethereum_call");
+
+        let start = Instant::now();
+        let calls: Vec<_> = runnables
+            .iter()
+            .map(|r| &r.hosted_triggers)
+            .flatten()
+            .filter_map(|trigger| {
+                trigger
+                    .mapping_trigger
+                    .trigger
+                    .as_onchain()
+                    .map(|t| (trigger.host.host_metrics(), t))
+            })
+            .filter_map(|(metrics, trigger)| match trigger {
+                MappingTrigger::Log { calls, .. } => Some(
+                    calls
+                        .clone()
+                        .into_iter()
+                        .map(move |call| (metrics.cheap_clone(), call)),
+                ),
+                MappingTrigger::Block { .. } | MappingTrigger::Call { .. } => None,
+            })
+            .flatten()
+            .collect();
+
+        // Deduplicate calls. Unfortunately, we can't get `DeclaredCall` to
+        // implement `Hash` or `Ord` easily, so we can only deduplicate by
+        // comparing the whole call not with a `HashSet` or `BTreeSet`.
+        // Since that can be inefficient, we don't deduplicate if we have an
+        // enormous amount of calls; in that case though, things will likely
+        // blow up because of the amount of I/O that many calls cause.
+        // Cutting off at 1000 is fairly arbitrary
+        let calls = if calls.len() < 1000 {
+            let mut uniq_calls = Vec::new();
+            for (metrics, call) in calls {
+                if !uniq_calls.iter().any(|(_, c)| c == &call) {
+                    uniq_calls.push((metrics, call));
+                }
+            }
+            uniq_calls
+        } else {
+            calls
+        };
+
+        let calls_count = calls.len();
+        let results = self.eth_calls(logger, block_ptr, calls).await?;
+        log_results(
+            logger,
+            &results,
+            calls_count,
+            runnables.len(),
+            start.elapsed(),
+        );
+
+        Ok(runnables)
     }
 }
 
@@ -994,12 +1435,6 @@ pub struct UnresolvedMappingABI {
     pub file: Link,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct MappingABI {
-    pub name: String,
-    pub contract: Contract,
-}
-
 impl UnresolvedMappingABI {
     pub async fn resolve(
         self,
@@ -1020,10 +1455,73 @@ impl UnresolvedMappingABI {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MappingABI {
+    pub name: String,
+    pub contract: Contract,
+}
+
+impl MappingABI {
+    pub fn function(
+        &self,
+        contract_name: &str,
+        name: &str,
+        signature: Option<&str>,
+    ) -> Result<&Function, Error> {
+        let contract = &self.contract;
+        let function = match signature {
+            // Behavior for apiVersion < 0.0.4: look up function by name; for overloaded
+            // functions this always picks the same overloaded variant, which is incorrect
+            // and may lead to encoding/decoding errors
+            None => contract.function(name).with_context(|| {
+                format!(
+                    "Unknown function \"{}::{}\" called from WASM runtime",
+                    contract_name, name
+                )
+            })?,
+
+            // Behavior for apiVersion >= 0.0.04: look up function by signature of
+            // the form `functionName(uint256,string) returns (bytes32,string)`; this
+            // correctly picks the correct variant of an overloaded function
+            Some(ref signature) => contract
+                .functions_by_name(name)
+                .with_context(|| {
+                    format!(
+                        "Unknown function \"{}::{}\" called from WASM runtime",
+                        contract_name, name
+                    )
+                })?
+                .iter()
+                .find(|f| signature == &f.signature())
+                .with_context(|| {
+                    format!(
+                        "Unknown function \"{}::{}\" with signature `{}` \
+                             called from WASM runtime",
+                        contract_name, name, signature,
+                    )
+                })?,
+        };
+        Ok(function)
+    }
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
 pub struct MappingBlockHandler {
     pub handler: String,
     pub filter: Option<BlockHandlerFilter>,
+}
+
+impl MappingBlockHandler {
+    pub fn kind(&self) -> &str {
+        match &self.filter {
+            Some(filter) => match filter {
+                BlockHandlerFilter::Call => "block_filter_call",
+                BlockHandlerFilter::Once => "block_filter_once",
+                BlockHandlerFilter::Polling { .. } => "block_filter_polling",
+            },
+            None => BLOCK_HANDLER_KIND,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
@@ -1032,6 +1530,10 @@ pub enum BlockHandlerFilter {
     // Call filter will trigger on all blocks where the data source contract
     // address has been called
     Call,
+    // This filter will trigger once at the startBlock
+    Once,
+    // This filter will trigger in a recurring interval set by the `every` field.
+    Polling { every: NonZeroU32 },
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
@@ -1044,15 +1546,76 @@ pub struct MappingCallHandler {
 pub struct MappingEventHandler {
     pub event: String,
     pub topic0: Option<H256>,
+    #[serde(deserialize_with = "deserialize_h256_vec", default)]
+    pub topic1: Option<Vec<H256>>,
+    #[serde(deserialize_with = "deserialize_h256_vec", default)]
+    pub topic2: Option<Vec<H256>>,
+    #[serde(deserialize_with = "deserialize_h256_vec", default)]
+    pub topic3: Option<Vec<H256>>,
     pub handler: String,
     #[serde(default)]
     pub receipt: bool,
+    #[serde(default)]
+    pub calls: CallDecls,
+}
+
+// Custom deserializer for H256 fields that removes the '0x' prefix before parsing
+fn deserialize_h256_vec<'de, D>(deserializer: D) -> Result<Option<Vec<H256>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<Vec<String>> = Option::deserialize(deserializer)?;
+
+    match s {
+        Some(vec) => {
+            let mut h256_vec = Vec::new();
+            for hex_str in vec {
+                // Remove '0x' prefix if present
+                let clean_hex_str = hex_str.trim_start_matches("0x");
+                // Ensure the hex string is 64 characters long, after removing '0x'
+                let padded_hex_str = format!("{:0>64}", clean_hex_str);
+                // Parse the padded string into H256, handling potential errors
+                h256_vec.push(
+                    H256::from_str(&padded_hex_str)
+                        .map_err(|e| D::Error::custom(format!("Failed to parse H256: {}", e)))?,
+                );
+            }
+            Ok(Some(h256_vec))
+        }
+        None => Ok(None),
+    }
 }
 
 impl MappingEventHandler {
     pub fn topic0(&self) -> H256 {
         self.topic0
             .unwrap_or_else(|| string_to_h256(&self.event.replace("indexed ", "")))
+    }
+
+    pub fn matches(&self, log: &Log) -> bool {
+        let matches_topic = |index: usize, topic_opt: &Option<Vec<H256>>| -> bool {
+            topic_opt.as_ref().map_or(true, |topic_vec| {
+                log.topics
+                    .get(index)
+                    .map_or(false, |log_topic| topic_vec.contains(log_topic))
+            })
+        };
+
+        if let Some(topic0) = log.topics.get(0) {
+            return self.topic0() == *topic0
+                && matches_topic(1, &self.topic1)
+                && matches_topic(2, &self.topic2)
+                && matches_topic(3, &self.topic3);
+        }
+
+        // Logs without topic0 should simply be skipped
+        false
+    }
+
+    pub fn has_additional_topics(&self) -> bool {
+        self.topic1.as_ref().map_or(false, |v| !v.is_empty())
+            || self.topic2.as_ref().map_or(false, |v| !v.is_empty())
+            || self.topic3.as_ref().map_or(false, |v| !v.is_empty())
     }
 }
 
@@ -1073,4 +1636,215 @@ fn string_to_h256(s: &str) -> H256 {
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
 pub struct TemplateSource {
     pub abi: String,
+}
+
+/// Internal representation of declared calls. In the manifest that's
+/// written as part of an event handler as
+/// ```yaml
+/// calls:
+///   - myCall1: Contract[address].function(arg1, arg2, ...)
+///   - ..
+/// ```
+///
+/// The `address` and `arg` fields can be either `event.address` or
+/// `event.params.<name>`. Each entry under `calls` gets turned into a
+/// `CallDcl`
+#[derive(Clone, CheapClone, Debug, Default, Hash, Eq, PartialEq)]
+pub struct CallDecls {
+    pub decls: Arc<Vec<CallDecl>>,
+    readonly: (),
+}
+
+/// A single call declaration, like `myCall1:
+/// Contract[address].function(arg1, arg2, ...)`
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct CallDecl {
+    /// A user-defined label
+    pub label: String,
+    /// The call expression
+    pub expr: CallExpr,
+    readonly: (),
+}
+impl CallDecl {
+    fn address(&self, log: &Log, params: &[LogParam]) -> Result<H160, Error> {
+        let address = match &self.expr.address {
+            CallArg::Address => log.address,
+            CallArg::Param(name) => {
+                let value = params
+                    .iter()
+                    .find(|param| &param.name == name.as_str())
+                    .ok_or_else(|| anyhow!("unknown param {name}"))?
+                    .value
+                    .clone();
+                value
+                    .into_address()
+                    .ok_or_else(|| anyhow!("param {name} is not an address"))?
+            }
+        };
+        Ok(address)
+    }
+
+    fn args(&self, log: &Log, params: &[LogParam]) -> Result<Vec<Token>, Error> {
+        self.expr
+            .args
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Address => Ok(Token::Address(log.address)),
+                CallArg::Param(name) => {
+                    let value = params
+                        .iter()
+                        .find(|param| &param.name == name.as_str())
+                        .ok_or_else(|| anyhow!("unknown param {name}"))?
+                        .value
+                        .clone();
+                    Ok(value)
+                }
+            })
+            .collect()
+    }
+}
+
+impl<'de> de::Deserialize<'de> for CallDecls {
+    fn deserialize<D>(deserializer: D) -> Result<CallDecls, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let decls: std::collections::HashMap<String, String> =
+            de::Deserialize::deserialize(deserializer)?;
+        let decls = decls
+            .into_iter()
+            .map(|(name, expr)| {
+                expr.parse::<CallExpr>().map(|expr| CallDecl {
+                    label: name,
+                    expr,
+                    readonly: (),
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(|decls| Arc::new(decls))
+            .map_err(de::Error::custom)?;
+        Ok(CallDecls {
+            decls,
+            readonly: (),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct CallExpr {
+    pub abi: Word,
+    pub address: CallArg,
+    pub func: Word,
+    pub args: Vec<CallArg>,
+    readonly: (),
+}
+
+/// Parse expressions of the form `Contract[address].function(arg1, arg2,
+/// ...)` where the `address` and the args are either `event.address` or
+/// `event.params.<name>`.
+///
+/// The parser is pretty awful as it generates error messages that aren't
+/// very helpful. We should replace all this with a real parser, most likely
+/// `combine` which is what `graphql_parser` uses
+impl FromStr for CallExpr {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        lazy_static! {
+            static ref RE: Regex = Regex::new(
+                r"(?x)
+                (?P<abi>[a-zA-Z0-9_]+)\[
+                    (?P<address>[^]]+)\]
+                \.
+                (?P<func>[a-zA-Z0-9_]+)\(
+                    (?P<args>[^)]*)
+                \)"
+            )
+            .unwrap();
+        }
+        let x = RE
+            .captures(s)
+            .ok_or_else(|| anyhow!("invalid call expression `{s}`"))?;
+        let abi = Word::from(x.name("abi").unwrap().as_str());
+        let address = x.name("address").unwrap().as_str().parse()?;
+        let func = Word::from(x.name("func").unwrap().as_str());
+        let args: Vec<CallArg> = x
+            .name("args")
+            .unwrap()
+            .as_str()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().parse::<CallArg>())
+            .collect::<Result<_, _>>()?;
+        Ok(CallExpr {
+            abi,
+            address,
+            func,
+            args,
+            readonly: (),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub enum CallArg {
+    Address,
+    Param(Word),
+}
+
+impl FromStr for CallArg {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        fn invalid(s: &str) -> Result<CallArg, anyhow::Error> {
+            Err(anyhow!("invalid call argument `{}`", s))
+        }
+
+        let mut parts = s.split(".");
+        match parts.next() {
+            Some("event") => { /* ok */ }
+            Some(_) => return Err(anyhow!("call arguments must start with `event`")),
+            None => return Err(anyhow!("empty call argument")),
+        }
+        match parts.next() {
+            Some("address") => Ok(CallArg::Address),
+            Some("params") => match parts.next() {
+                Some(s) => Ok(CallArg::Param(Word::from(s))),
+                None => invalid(s),
+            },
+            Some(s) => invalid(s),
+            None => invalid(s),
+        }
+    }
+}
+
+#[test]
+fn test_call_expr() {
+    let expr: CallExpr = "ERC20[event.address].balanceOf(event.params.token)"
+        .parse()
+        .unwrap();
+    assert_eq!(expr.abi, "ERC20");
+    assert_eq!(expr.address, CallArg::Address);
+    assert_eq!(expr.func, "balanceOf");
+    assert_eq!(expr.args, vec![CallArg::Param("token".into())]);
+
+    let expr: CallExpr = "Pool[event.params.pool].fees(event.params.token0, event.params.token1)"
+        .parse()
+        .unwrap();
+    assert_eq!(expr.abi, "Pool");
+    assert_eq!(expr.address, CallArg::Param("pool".into()));
+    assert_eq!(expr.func, "fees");
+    assert_eq!(
+        expr.args,
+        vec![
+            CallArg::Param("token0".into()),
+            CallArg::Param("token1".into())
+        ]
+    );
+
+    let expr: CallExpr = "Pool[event.address].growth()".parse().unwrap();
+    assert_eq!(expr.abi, "Pool");
+    assert_eq!(expr.address, CallArg::Address);
+    assert_eq!(expr.func, "growth");
+    assert_eq!(expr.args, vec![]);
 }

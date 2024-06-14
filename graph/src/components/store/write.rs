@@ -2,14 +2,14 @@
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    blockchain::{block_stream::FirehoseCursor, BlockPtr},
+    blockchain::{block_stream::FirehoseCursor, BlockPtr, BlockTime},
     cheap_clone::CheapClone,
     components::subgraph::Entity,
     constraint_violation,
-    data::{subgraph::schema::SubgraphError, value::Word},
+    data::{store::Id, subgraph::schema::SubgraphError},
     data_source::CausalityRegion,
+    derive::CacheWeight,
     prelude::DeploymentHash,
-    schema::InputSchema,
     util::cache_weight::CacheWeight,
 };
 
@@ -37,19 +37,19 @@ use super::{BlockNumber, EntityKey, EntityType, StoreError, StoreEvent, StoredDy
 /// `append_row`, eliminates an update in the database which would otherwise
 /// be needed to clamp the open block range of the entity to the block
 /// contained in `end`
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, CacheWeight, Debug, PartialEq, Eq)]
 pub enum EntityModification {
     /// Insert the entity
     Insert {
         key: EntityKey,
-        data: Entity,
+        data: Arc<Entity>,
         block: BlockNumber,
         end: Option<BlockNumber>,
     },
     /// Update the entity by overwriting it
     Overwrite {
         key: EntityKey,
-        data: Entity,
+        data: Arc<Entity>,
         block: BlockNumber,
         end: Option<BlockNumber>,
     },
@@ -60,13 +60,23 @@ pub enum EntityModification {
 /// A helper struct for passing entity writes to the outside world, viz. the
 /// SQL query generation that inserts rows
 pub struct EntityWrite<'a> {
-    pub id: &'a Word,
+    pub id: &'a Id,
     pub entity: &'a Entity,
     pub causality_region: CausalityRegion,
     pub block: BlockNumber,
     // The end of the block range for which this write is valid. The value
     // of `end` itself is not included in the range
     pub end: Option<BlockNumber>,
+}
+
+impl std::fmt::Display for EntityWrite<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let range = match self.end {
+            Some(end) => format!("[{}, {}]", self.block, end - 1),
+            None => format!("[{}, ∞)", self.block),
+        };
+        write!(f, "{}@{}", self.id, range)
+    }
 }
 
 impl<'a> TryFrom<&'a EntityModification> for EntityWrite<'a> {
@@ -79,15 +89,21 @@ impl<'a> TryFrom<&'a EntityModification> for EntityWrite<'a> {
                 data,
                 block,
                 end,
-            }
-            | EntityModification::Overwrite {
+            } => Ok(EntityWrite {
+                id: &key.entity_id,
+                entity: data,
+                causality_region: key.causality_region,
+                block: *block,
+                end: *end,
+            }),
+            EntityModification::Overwrite {
                 key,
                 data,
                 block,
                 end,
             } => Ok(EntityWrite {
                 id: &key.entity_id,
-                entity: data,
+                entity: &data,
                 causality_region: key.causality_region,
                 block: *block,
                 end: *end,
@@ -99,7 +115,7 @@ impl<'a> TryFrom<&'a EntityModification> for EntityWrite<'a> {
 }
 
 impl EntityModification {
-    pub fn id(&self) -> &Word {
+    pub fn id(&self) -> &Id {
         match self {
             EntityModification::Insert { key, .. }
             | EntityModification::Overwrite { key, .. }
@@ -258,7 +274,7 @@ impl EntityModification {
     pub fn insert(key: EntityKey, data: Entity, block: BlockNumber) -> Self {
         EntityModification::Insert {
             key,
-            data,
+            data: Arc::new(data),
             block,
             end: None,
         }
@@ -267,7 +283,7 @@ impl EntityModification {
     pub fn overwrite(key: EntityKey, data: Entity, block: BlockNumber) -> Self {
         EntityModification::Overwrite {
             key,
-            data,
+            data: Arc::new(data),
             block,
             end: None,
         }
@@ -286,7 +302,7 @@ impl EntityModification {
 }
 
 /// A list of entity changes grouped by the entity type
-#[derive(Debug)]
+#[derive(Debug, CacheWeight)]
 pub struct RowGroup {
     pub entity_type: EntityType,
     /// All changes for this entity type, ordered by block; i.e., if `i < j`
@@ -384,7 +400,7 @@ impl RowGroup {
     }
 
     /// Find the most recent entry for `id`
-    fn prev_row_mut(&mut self, id: &Word) -> Option<&mut EntityModification> {
+    fn prev_row_mut(&mut self, id: &Id) -> Option<&mut EntityModification> {
         self.rows.iter_mut().rfind(|emod| emod.id() == id)
     }
 
@@ -476,8 +492,8 @@ impl RowGroup {
         Ok(())
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = &str> {
-        self.rows.iter().map(|emod| emod.id().as_str())
+    pub fn ids(&self) -> impl Iterator<Item = &Id> {
+        self.rows.iter().map(|emod| emod.id())
     }
 }
 
@@ -522,18 +538,14 @@ impl<'a> Iterator for ClampsByBlockIterator<'a> {
 }
 
 /// A list of entity changes with one group per entity type
-#[derive(Debug)]
+#[derive(Debug, CacheWeight)]
 pub struct RowGroups {
-    schema: Arc<InputSchema>,
     pub groups: Vec<RowGroup>,
 }
 
 impl RowGroups {
-    fn new(schema: Arc<InputSchema>) -> Self {
-        Self {
-            schema,
-            groups: Vec::new(),
-        }
+    fn new() -> Self {
+        Self { groups: Vec::new() }
     }
 
     fn group(&self, entity_type: &EntityType) -> Option<&RowGroup> {
@@ -552,7 +564,7 @@ impl RowGroups {
         match pos {
             Some(pos) => &mut self.groups[pos],
             None => {
-                let immutable = self.schema.is_immutable(entity_type);
+                let immutable = entity_type.is_immutable();
                 self.groups
                     .push(RowGroup::new(entity_type.clone(), immutable));
                 // unwrap: we just pushed an entry
@@ -618,6 +630,11 @@ pub enum EntityOp<'a> {
 pub struct Batch {
     /// The last block for which this batch contains changes
     pub block_ptr: BlockPtr,
+    /// The timestamp for each block number we've seen as batches have been
+    /// appended to this one. This will have one entry for each block where
+    /// the subgraph performed a write. Entries are in ascending order of
+    /// block number
+    pub block_times: Vec<(BlockNumber, BlockTime)>,
     /// The first block for which this batch contains changes
     pub first_block: BlockNumber,
     /// The firehose cursor corresponding to `block_ptr`
@@ -629,12 +646,18 @@ pub struct Batch {
     pub offchain_to_remove: DataSources,
     pub error: Option<StoreError>,
     pub is_non_fatal_errors_active: bool,
+    /// Memoize the indirect weight of the batch. We need the `CacheWeight`
+    /// of the batch a lot in the write queue to determine if a batch should
+    /// be written. Recalculating it every time, which has to happen while
+    /// the writer holds a lock, conflicts with appending to the batch and
+    /// causes batches to be finished prematurely.
+    indirect_weight: usize,
 }
 
 impl Batch {
     pub fn new(
-        schema: Arc<InputSchema>,
         block_ptr: BlockPtr,
+        block_time: BlockTime,
         firehose_cursor: FirehoseCursor,
         mut raw_mods: Vec<EntityModification>,
         data_sources: Vec<StoredDynamicDataSource>,
@@ -654,7 +677,7 @@ impl Batch {
             EntityModification::Remove { .. } => 0,
         });
 
-        let mut mods = RowGroups::new(schema);
+        let mut mods = RowGroups::new();
 
         for m in raw_mods {
             mods.group_entry(&m.key().entity_type).push(m, block)?;
@@ -663,9 +686,11 @@ impl Batch {
         let data_sources = DataSources::new(block_ptr.cheap_clone(), data_sources);
         let offchain_to_remove = DataSources::new(block_ptr.cheap_clone(), offchain_to_remove);
         let first_block = block_ptr.number;
-        Ok(Self {
+        let block_times = vec![(block, block_time)];
+        let mut batch = Self {
             block_ptr,
             first_block,
+            block_times,
             firehose_cursor,
             mods,
             data_sources,
@@ -673,7 +698,10 @@ impl Batch {
             offchain_to_remove,
             error: None,
             is_non_fatal_errors_active,
-        })
+            indirect_weight: 0,
+        };
+        batch.weigh();
+        Ok(batch)
     }
 
     fn append_inner(&mut self, mut batch: Batch) -> Result<(), StoreError> {
@@ -682,6 +710,7 @@ impl Batch {
         }
 
         self.block_ptr = batch.block_ptr;
+        self.block_times.append(&mut batch.block_times);
         self.firehose_cursor = batch.firehose_cursor;
         self.mods.append(batch.mods)?;
         self.data_sources.append(batch.data_sources);
@@ -703,6 +732,7 @@ impl Batch {
         if let Err(e) = &res {
             self.error = Some(e.clone());
         }
+        self.weigh();
         res
     }
 
@@ -763,35 +793,15 @@ impl Batch {
     pub fn groups<'a>(&'a self) -> impl Iterator<Item = &'a RowGroup> {
         self.mods.groups.iter()
     }
+
+    fn weigh(&mut self) {
+        self.indirect_weight = self.mods.indirect_weight();
+    }
 }
 
 impl CacheWeight for Batch {
     fn indirect_weight(&self) -> usize {
-        self.mods.indirect_weight()
-    }
-}
-
-impl CacheWeight for RowGroups {
-    fn indirect_weight(&self) -> usize {
-        self.groups.indirect_weight()
-    }
-}
-
-impl CacheWeight for RowGroup {
-    fn indirect_weight(&self) -> usize {
-        self.rows.indirect_weight()
-    }
-}
-
-impl CacheWeight for EntityModification {
-    fn indirect_weight(&self) -> usize {
-        match self {
-            EntityModification::Insert { key, data, .. }
-            | EntityModification::Overwrite { key, data, .. } => {
-                key.indirect_weight() + data.indirect_weight()
-            }
-            EntityModification::Remove { key, .. } => key.indirect_weight(),
-        }
+        self.indirect_weight
     }
 }
 
@@ -851,6 +861,10 @@ impl<'a> WriteChunk<'a> {
         self.iter().next().is_none()
     }
 
+    pub fn len(&self) -> usize {
+        (self.group.row_count() - self.position).min(self.chunk_size)
+    }
+
     pub fn iter(&self) -> WriteChunkIter<'a> {
         WriteChunkIter {
             group: self.group,
@@ -901,11 +915,13 @@ impl<'a> Iterator for WriteChunkIter<'a> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use crate::{
         components::store::{
-            write::EntityModification, write::EntityOp, BlockNumber, EntityKey, EntityType,
-            StoreError,
+            write::EntityModification, write::EntityOp, BlockNumber, EntityType, StoreError,
         },
+        data::{store::Id, value::Word},
         entity,
         prelude::DeploymentHash,
         schema::InputSchema,
@@ -916,18 +932,22 @@ mod test {
 
     #[track_caller]
     fn check_runs(values: &[usize], blocks: &[BlockNumber], exp: &[(BlockNumber, &[usize])]) {
+        fn as_id(n: &usize) -> Id {
+            Id::String(Word::from(n.to_string()))
+        }
+
         assert_eq!(values.len(), blocks.len());
 
         let rows = values
             .iter()
             .zip(blocks.iter())
             .map(|(value, block)| EntityModification::Remove {
-                key: EntityKey::data("RowGroup".to_string(), value.to_string()),
+                key: ROW_GROUP_TYPE.key(Id::String(Word::from(value.to_string()))),
                 block: *block,
             })
             .collect();
         let group = RowGroup {
-            entity_type: EntityType::new("Entry".to_string()),
+            entity_type: ENTRY_TYPE.clone(),
             rows,
             immutable: false,
         };
@@ -938,14 +958,14 @@ mod test {
                     block,
                     entries
                         .iter()
-                        .map(|entry| entry.id().parse().unwrap())
+                        .map(|entry| entry.id().clone())
                         .collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>();
         let exp = Vec::from_iter(
             exp.into_iter()
-                .map(|(block, values)| (*block, Vec::from_iter(values.iter().cloned()))),
+                .map(|(block, values)| (*block, Vec::from_iter(values.iter().map(as_id)))),
         );
         assert_eq!(exp, act);
     }
@@ -964,11 +984,19 @@ mod test {
         check_runs(&[10, 20, 11], &[1, 2, 1], exp);
     }
 
-    const GQL: &str = "type Thing @entity { id: ID!, count: Int! }";
+    // A very fake schema that allows us to get the entity types we need
+    const GQL: &str = r#"
+      type Thing @entity { id: ID!, count: Int! }
+      type RowGroup @entity { id: ID! }
+      type Entry @entity { id: ID! }
+    "#;
     lazy_static! {
         static ref DEPLOYMENT: DeploymentHash = DeploymentHash::new("batchAppend").unwrap();
-        static ref SCHEMA: InputSchema = InputSchema::parse(GQL, DEPLOYMENT.clone()).unwrap();
-        static ref ENTITY_TYPE: EntityType = EntityType::new("Thing".to_string());
+        static ref SCHEMA: InputSchema =
+            InputSchema::parse_latest(GQL, DEPLOYMENT.clone()).unwrap();
+        static ref THING_TYPE: EntityType = SCHEMA.entity_type("Thing").unwrap();
+        static ref ROW_GROUP_TYPE: EntityType = SCHEMA.entity_type("RowGroup").unwrap();
+        static ref ENTRY_TYPE: EntityType = SCHEMA.entity_type("Entry").unwrap();
     }
 
     /// Convenient notation for changes to a fixed entity
@@ -988,30 +1016,30 @@ mod test {
             use Mod::*;
 
             let value = value.clone();
-            let key = EntityKey::data("Thing", "one");
+            let key = THING_TYPE.parse_key("one").unwrap();
             match value {
                 Ins(block) => EntityModification::Insert {
                     key,
-                    data: entity! { SCHEMA => id: "one", count: block },
+                    data: Arc::new(entity! { SCHEMA => id: "one", count: block }),
                     block,
                     end: None,
                 },
                 Ovw(block) => EntityModification::Overwrite {
                     key,
-                    data: entity! { SCHEMA => id: "one", count: block },
+                    data: Arc::new(entity! { SCHEMA => id: "one", count: block }),
                     block,
                     end: None,
                 },
                 Rem(block) => EntityModification::Remove { key, block },
                 InsC(block, end) => EntityModification::Insert {
                     key,
-                    data: entity! { SCHEMA => id: "one", count: block },
+                    data: Arc::new(entity! { SCHEMA => id: "one", count: block }),
                     block,
                     end: Some(end),
                 },
                 OvwC(block, end) => EntityModification::Overwrite {
                     key,
-                    data: entity! { SCHEMA => id: "one", count: block },
+                    data: Arc::new(entity! { SCHEMA => id: "one", count: block }),
                     block,
                     end: Some(end),
                 },
@@ -1028,7 +1056,7 @@ mod test {
     impl Group {
         fn new() -> Self {
             Self {
-                group: RowGroup::new(ENTITY_TYPE.clone(), false),
+                group: RowGroup::new(THING_TYPE.clone(), false),
             }
         }
 
@@ -1092,7 +1120,7 @@ mod test {
     fn last_op() {
         #[track_caller]
         fn is_remove(group: &RowGroup, at: BlockNumber) {
-            let key = EntityKey::data("Thing", "one");
+            let key = THING_TYPE.parse_key("one").unwrap();
             let op = group.last_op(&key, at).unwrap();
 
             assert!(
@@ -1104,7 +1132,7 @@ mod test {
         }
         #[track_caller]
         fn is_write(group: &RowGroup, at: BlockNumber) {
-            let key = EntityKey::data("Thing", "one");
+            let key = THING_TYPE.parse_key("one").unwrap();
             let op = group.last_op(&key, at).unwrap();
 
             assert!(
@@ -1117,7 +1145,7 @@ mod test {
 
         use Mod::*;
 
-        let key = EntityKey::data("Thing", "one");
+        let key = THING_TYPE.parse_key("one").unwrap();
 
         // This will result in two mods int the group:
         //   [ InsC(1,2), InsC(2,3) ]

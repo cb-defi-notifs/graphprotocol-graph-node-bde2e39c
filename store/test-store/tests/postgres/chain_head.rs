@@ -1,7 +1,11 @@
 //! Test ChainStore implementation of Store, in particular, how
 //! the chain head pointer gets updated in various situations
 
-use graph::prelude::futures03::executor;
+use graph::blockchain::{BlockHash, BlockPtr};
+use graph::data::store::ethereum::call;
+use graph::data::store::scalar::Bytes;
+use graph::env::ENV_VARS;
+use graph::futures03::executor;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -16,9 +20,9 @@ use graph_store_postgres::Store as DieselStore;
 use graph_store_postgres::{layout_for_tests::FAKE_NETWORK_SHARED, ChainStore as DieselChainStore};
 
 use test_store::block_store::{
-    FakeBlock, FakeBlockList, BLOCK_FIVE, BLOCK_FOUR, BLOCK_ONE, BLOCK_ONE_NO_PARENT,
-    BLOCK_ONE_SIBLING, BLOCK_THREE, BLOCK_THREE_NO_PARENT, BLOCK_TWO, BLOCK_TWO_NO_PARENT,
-    GENESIS_BLOCK, NO_PARENT,
+    FakeBlock, FakeBlockList, BLOCK_FIVE, BLOCK_FIVE_AFTER_SKIP, BLOCK_FOUR,
+    BLOCK_FOUR_SKIPPED_2_AND_3, BLOCK_ONE, BLOCK_ONE_NO_PARENT, BLOCK_ONE_SIBLING, BLOCK_THREE,
+    BLOCK_THREE_NO_PARENT, BLOCK_TWO, BLOCK_TWO_NO_PARENT, GENESIS_BLOCK, NO_PARENT,
 };
 use test_store::*;
 
@@ -33,30 +37,37 @@ where
 {
     run_test_sequentially(|store| async move {
         for name in &[NETWORK_NAME, FAKE_NETWORK_SHARED] {
-            block_store::set_chain(chain.clone(), name);
+            block_store::set_chain(chain.clone(), name).await;
 
             let chain_store = store.block_store().chain_store(name).expect("chain store");
 
             // Run test
-            test(chain_store.cheap_clone(), store.cheap_clone())
-                .unwrap_or_else(|_| panic!("test finishes successfully on network {}", name));
+            test(chain_store.cheap_clone(), store.cheap_clone()).unwrap_or_else(|err| {
+                panic!(
+                    "test finishes successfully on network {} with error {}",
+                    name, err
+                )
+            });
         }
     });
 }
 
 fn run_test_async<R, F>(chain: FakeBlockList, test: F)
 where
-    F: Fn(Arc<DieselChainStore>, Arc<DieselStore>) -> R + Send + Sync + 'static,
+    F: Fn(Arc<DieselChainStore>, Arc<DieselStore>, Vec<(BlockPtr, BlockHash)>) -> R
+        + Send
+        + Sync
+        + 'static,
     R: Future<Output = ()> + Send + 'static,
 {
     run_test_sequentially(|store| async move {
         for name in &[NETWORK_NAME, FAKE_NETWORK_SHARED] {
-            block_store::set_chain(chain.clone(), name);
+            let cached = block_store::set_chain(chain.clone(), name).await;
 
             let chain_store = store.block_store().chain_store(name).expect("chain store");
 
             // Run test
-            test(chain_store.cheap_clone(), store.clone()).await;
+            test(chain_store.cheap_clone(), store.clone(), cached).await;
         }
     });
 }
@@ -66,12 +77,15 @@ where
 /// `attempt_chain_head_update` and check its result. Check that the new head
 /// is the one indicated in `head_exp`. If `missing` is not `None`, check that
 /// `attempt_chain_head_update` reports that block as missing
-fn check_chain_head_update(
+fn check_chain_head_update_cache(
     chain: FakeBlockList,
     head_exp: Option<&'static FakeBlock>,
     missing: Option<&'static str>,
+    cached_exp: usize,
 ) {
-    run_test_async(chain, move |store, _| async move {
+    let cached_exp = ENV_VARS.store.recent_blocks_cache_capacity.min(cached_exp);
+
+    run_test_async(chain, move |store, _, cached| async move {
         let missing_act: Vec<_> = store
             .clone()
             .attempt_chain_head_update(ANCESTOR_COUNT)
@@ -90,7 +104,35 @@ fn check_chain_head_update(
             .expect("chain_head_ptr failed")
             .map(|ebp| ebp.hash_hex());
         assert_eq!(head_hash_exp, head_hash_act);
+
+        assert_eq!(cached_exp, cached.len());
     })
+}
+
+fn check_chain_head_update(
+    chain: FakeBlockList,
+    head_exp: Option<&'static FakeBlock>,
+    missing: Option<&'static str>,
+) {
+    let cached_exp = chain
+        .iter()
+        .filter(|block| block.number != 0)
+        .fold((0, None), |(len, parent_hash), block| {
+            match (len, parent_hash) {
+                (0, None) => (1, Some(&block.hash)),
+                (0, Some(_)) | (_, None) => unreachable!(),
+                (len, Some(parent_hash)) => {
+                    if &block.parent_hash == parent_hash {
+                        (len + 1, Some(&block.hash))
+                    } else {
+                        (1, Some(&block.hash))
+                    }
+                }
+            }
+        })
+        .0;
+
+    check_chain_head_update_cache(chain, head_exp, missing, cached_exp);
 }
 
 #[test]
@@ -117,7 +159,7 @@ fn genesis_plus_one_with_sibling() {
     // Two valid blocks at the same height should give an error, but
     // we currently get one of them at random
     let chain = vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_ONE_SIBLING];
-    check_chain_head_update(chain, Some(&*BLOCK_ONE), None);
+    check_chain_head_update_cache(chain, Some(&*BLOCK_ONE), None, 1);
 }
 
 #[test]
@@ -135,7 +177,7 @@ fn long_chain() {
         &*BLOCK_FOUR,
         &*BLOCK_FIVE,
     ];
-    check_chain_head_update(chain, Some(&*BLOCK_FIVE), None);
+    check_chain_head_update_cache(chain, Some(&*BLOCK_FIVE), None, 5);
 }
 
 #[test]
@@ -163,7 +205,7 @@ fn long_chain_with_uncles() {
         &*BLOCK_THREE_NO_PARENT,
         &*BLOCK_FOUR,
     ];
-    check_chain_head_update(chain, Some(&*BLOCK_FOUR), None);
+    check_chain_head_update_cache(chain, Some(&*BLOCK_FOUR), None, 4);
 }
 
 #[test]
@@ -171,7 +213,7 @@ fn test_get_block_number() {
     let chain = vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_TWO];
     let subgraph = DeploymentHash::new("nonExistentSubgraph").unwrap();
 
-    run_test_async(chain, move |_, subgraph_store| {
+    run_test_async(chain, move |_, subgraph_store, _| {
         let subgraph = subgraph.cheap_clone();
         async move {
             create_test_subgraph(&subgraph, "type Dummy @entity { id: ID! }").await;
@@ -256,12 +298,13 @@ fn check_ancestor(
     child: &FakeBlock,
     offset: BlockNumber,
     exp: &FakeBlock,
+    root: Option<BlockHash>,
 ) -> Result<(), Error> {
-    let act = executor::block_on(
-        store
-            .cheap_clone()
-            .ancestor_block(child.block_ptr(), offset),
-    )?
+    let act = executor::block_on(store.cheap_clone().ancestor_block(
+        child.block_ptr(),
+        offset,
+        root,
+    ))?
     .map(json::from_value::<EthereumBlock>)
     .transpose()?
     .ok_or_else(|| anyhow!("block {} has no ancestor at offset {}", child.hash, offset))?;
@@ -291,24 +334,25 @@ fn ancestor_block_simple() {
     ];
 
     run_test(chain, move |store, _| -> Result<(), Error> {
-        check_ancestor(&store, &BLOCK_FIVE, 1, &BLOCK_FOUR)?;
-        check_ancestor(&store, &BLOCK_FIVE, 2, &BLOCK_THREE)?;
-        check_ancestor(&store, &BLOCK_FIVE, 3, &BLOCK_TWO)?;
-        check_ancestor(&store, &BLOCK_FIVE, 4, &BLOCK_ONE)?;
-        check_ancestor(&store, &BLOCK_FIVE, 5, &GENESIS_BLOCK)?;
-        check_ancestor(&store, &BLOCK_THREE, 2, &BLOCK_ONE)?;
+        check_ancestor(&store, &BLOCK_FIVE, 1, &BLOCK_FOUR, None)?;
+        check_ancestor(&store, &BLOCK_FIVE, 2, &BLOCK_THREE, None)?;
+        check_ancestor(&store, &BLOCK_FIVE, 3, &BLOCK_TWO, None)?;
+        check_ancestor(&store, &BLOCK_FIVE, 4, &BLOCK_ONE, None)?;
+        check_ancestor(&store, &BLOCK_FIVE, 5, &GENESIS_BLOCK, None)?;
+        check_ancestor(&store, &BLOCK_THREE, 2, &BLOCK_ONE, None)?;
 
         for offset in [6, 7, 8, 50].iter() {
             let offset = *offset;
-            let res = executor::block_on(
-                store
-                    .cheap_clone()
-                    .ancestor_block(BLOCK_FIVE.block_ptr(), offset),
-            );
+            let res = executor::block_on(store.cheap_clone().ancestor_block(
+                BLOCK_FIVE.block_ptr(),
+                offset,
+                None,
+            ));
             assert!(res.is_err());
         }
 
-        let block = executor::block_on(store.ancestor_block(BLOCK_TWO_NO_PARENT.block_ptr(), 1))?;
+        let block =
+            executor::block_on(store.ancestor_block(BLOCK_TWO_NO_PARENT.block_ptr(), 1, None))?;
         assert!(block.is_none());
         Ok(())
     });
@@ -324,10 +368,44 @@ fn ancestor_block_ommers() {
     ];
 
     run_test(chain, move |store, _| -> Result<(), Error> {
-        check_ancestor(&store, &BLOCK_ONE, 1, &GENESIS_BLOCK)?;
-        check_ancestor(&store, &BLOCK_ONE_SIBLING, 1, &GENESIS_BLOCK)?;
-        check_ancestor(&store, &BLOCK_TWO, 1, &BLOCK_ONE)?;
-        check_ancestor(&store, &BLOCK_TWO, 2, &GENESIS_BLOCK)?;
+        check_ancestor(&store, &BLOCK_ONE, 1, &GENESIS_BLOCK, None)?;
+        check_ancestor(&store, &BLOCK_ONE_SIBLING, 1, &GENESIS_BLOCK, None)?;
+        check_ancestor(&store, &BLOCK_TWO, 1, &BLOCK_ONE, None)?;
+        check_ancestor(&store, &BLOCK_TWO, 2, &GENESIS_BLOCK, None)?;
+        Ok(())
+    });
+}
+
+#[test]
+fn ancestor_block_skipped() {
+    let chain = vec![
+        &*GENESIS_BLOCK,
+        &*BLOCK_ONE,
+        &*BLOCK_FOUR_SKIPPED_2_AND_3,
+        &BLOCK_FIVE_AFTER_SKIP,
+    ];
+
+    run_test(chain, move |store, _| -> Result<(), Error> {
+        check_ancestor(&store, &BLOCK_FIVE_AFTER_SKIP, 2, &BLOCK_ONE, None)?;
+
+        check_ancestor(
+            &store,
+            &BLOCK_FIVE_AFTER_SKIP,
+            2,
+            &BLOCK_FOUR_SKIPPED_2_AND_3,
+            Some(BLOCK_ONE.block_hash()),
+        )?;
+
+        check_ancestor(&store, &BLOCK_FIVE_AFTER_SKIP, 5, &GENESIS_BLOCK, None)?;
+
+        check_ancestor(
+            &store,
+            &BLOCK_FIVE_AFTER_SKIP,
+            5,
+            &BLOCK_ONE,
+            Some(GENESIS_BLOCK.block_hash()),
+        )?;
+
         Ok(())
     });
 }
@@ -337,39 +415,66 @@ fn eth_call_cache() {
     let chain = vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_TWO];
 
     run_test(chain, |store, _| {
+        let logger = LOGGER.cheap_clone();
+        fn ccr(value: &[u8]) -> call::Retval {
+            call::Retval::Value(Bytes::from(value))
+        }
+
         let address = H160([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let call: [u8; 6] = [1, 2, 3, 4, 5, 6];
         let return_value: [u8; 3] = [7, 8, 9];
 
+        let call = call::Request::new(address, call.to_vec(), 0);
         store
-            .set_call(address, &call, BLOCK_ONE.block_ptr(), &return_value)
+            .set_call(
+                &logger,
+                call.cheap_clone(),
+                BLOCK_ONE.block_ptr(),
+                ccr(&return_value),
+            )
             .unwrap();
 
-        let ret = store
-            .get_call(address, &call, GENESIS_BLOCK.block_ptr())
-            .unwrap();
+        let ret = store.get_call(&call, GENESIS_BLOCK.block_ptr()).unwrap();
         assert!(ret.is_none());
 
         let ret = store
-            .get_call(address, &call, BLOCK_ONE.block_ptr())
+            .get_call(&call, BLOCK_ONE.block_ptr())
             .unwrap()
+            .unwrap()
+            .retval
             .unwrap();
         assert_eq!(&return_value, ret.as_slice());
 
-        let ret = store
-            .get_call(address, &call, BLOCK_TWO.block_ptr())
-            .unwrap();
+        let ret = store.get_call(&call, BLOCK_TWO.block_ptr()).unwrap();
         assert!(ret.is_none());
 
         let new_return_value: [u8; 3] = [10, 11, 12];
         store
-            .set_call(address, &call, BLOCK_TWO.block_ptr(), &new_return_value)
+            .set_call(
+                &logger,
+                call.cheap_clone(),
+                BLOCK_TWO.block_ptr(),
+                ccr(&new_return_value),
+            )
             .unwrap();
         let ret = store
-            .get_call(address, &call, BLOCK_TWO.block_ptr())
+            .get_call(&call, BLOCK_TWO.block_ptr())
             .unwrap()
+            .unwrap()
+            .retval
             .unwrap();
         assert_eq!(&new_return_value, ret.as_slice());
+
+        store
+            .set_call(
+                &logger,
+                call.cheap_clone(),
+                BLOCK_THREE.block_ptr(),
+                call::Retval::Null,
+            )
+            .unwrap();
+        let ret = store.get_call(&call, BLOCK_THREE.block_ptr()).unwrap();
+        assert_eq!(None, ret);
 
         Ok(())
     })
@@ -379,7 +484,7 @@ fn eth_call_cache() {
 /// Tests only query correctness. No data is involved.
 fn test_transaction_receipts_in_block_function() {
     let chain = vec![];
-    run_test_async(chain, move |store, _| async move {
+    run_test_async(chain, move |store, _, _| async move {
         let receipts = store
             .transaction_receipts_in_block(&H256::zero())
             .await

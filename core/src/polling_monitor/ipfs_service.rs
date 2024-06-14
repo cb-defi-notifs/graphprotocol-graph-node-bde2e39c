@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
-use futures::future::BoxFuture;
+use graph::futures03::future::BoxFuture;
 use graph::{
-    ipfs_client::{CidFile, IpfsClient, StatApi},
+    derive::CheapClone,
+    ipfs_client::{CidFile, IpfsClient},
     prelude::CheapClone,
 };
 use std::time::Duration;
@@ -15,7 +16,7 @@ pub type IpfsService = Buffer<CidFile, BoxFuture<'static, Result<Option<Bytes>, 
 
 pub fn ipfs_service(
     client: IpfsClient,
-    max_file_size: u64,
+    max_file_size: usize,
     timeout: Duration,
     rate_limit: u16,
 ) -> IpfsService {
@@ -35,21 +36,11 @@ pub fn ipfs_service(
     Buffer::new(svc, u32::MAX as usize)
 }
 
-#[derive(Clone)]
+#[derive(Clone, CheapClone)]
 struct IpfsServiceInner {
     client: IpfsClient,
-    max_file_size: u64,
+    max_file_size: usize,
     timeout: Duration,
-}
-
-impl CheapClone for IpfsServiceInner {
-    fn cheap_clone(&self) -> Self {
-        Self {
-            client: self.client.cheap_clone(),
-            max_file_size: self.max_file_size,
-            timeout: self.timeout,
-        }
-    }
 }
 
 impl IpfsServiceInner {
@@ -65,33 +56,20 @@ impl IpfsServiceInner {
             None => cid.to_string(),
         };
 
-        let size = match self
+        let res = self
             .client
-            .stat_size(StatApi::Files, cid_str.clone(), self.timeout)
-            .await
-        {
-            Ok(size) => size,
+            .cat_all(&cid_str, Some(self.timeout), self.max_file_size)
+            .await;
+
+        match res {
+            Ok(file_bytes) => Ok(Some(file_bytes)),
             Err(e) => match e.status().map(|e| e.as_u16()) {
+                // Timeouts in IPFS mean the file is not available, so we return `None`
                 Some(GATEWAY_TIMEOUT) | Some(CLOUDFLARE_TIMEOUT) => return Ok(None),
                 _ if e.is_timeout() => return Ok(None),
                 _ => return Err(e.into()),
             },
-        };
-
-        if size > self.max_file_size {
-            return Err(anyhow!(
-                "IPFS file {} is too large. It can be at most {} bytes but is {} bytes",
-                cid_str,
-                self.max_file_size,
-                size
-            ));
         }
-
-        Ok(self
-            .client
-            .cat_all(&cid_str, self.timeout)
-            .await
-            .map(Some)?)
     }
 }
 
@@ -124,7 +102,12 @@ mod test {
     use tower::ServiceExt;
 
     use cid::Cid;
-    use graph::{ipfs_client::IpfsClient, tokio};
+    use graph::{
+        components::link_resolver::{ArweaveClient, ArweaveResolver},
+        data::value::Word,
+        ipfs_client::IpfsClient,
+        tokio,
+    };
 
     use uuid::Uuid;
 
@@ -155,5 +138,19 @@ mod test {
             .unwrap()
             .unwrap();
         assert_eq!(content.to_vec(), uid.as_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    async fn arweave_get() {
+        const ID: &str = "8APeQ5lW0-csTcBaGdPBDLAL2ci2AT9pTn2tppGPU_8";
+
+        let cl = ArweaveClient::default();
+        let body = cl.get(&Word::from(ID)).await.unwrap();
+        let body = String::from_utf8(body).unwrap();
+
+        let expected = r#"
+            {"name":"Arloader NFT #1","description":"Super dope, one of a kind NFT","collection":{"name":"Arloader NFT","family":"We AR"},"attributes":[{"trait_type":"cx","value":-0.4042198883730073},{"trait_type":"cy","value":0.5641681708263335},{"trait_type":"iters","value":44}],"properties":{"category":"image","files":[{"uri":"https://arweave.net/7gWCr96zc0QQCXOsn5Vk9ROVGFbMaA9-cYpzZI8ZMDs","type":"image/png"},{"uri":"https://arweave.net/URwQtoqrbYlc5183STNy3ZPwSCRY4o8goaF7MJay3xY/1.png","type":"image/png"}]},"image":"https://arweave.net/URwQtoqrbYlc5183STNy3ZPwSCRY4o8goaF7MJay3xY/1.png"}
+        "#.trim_start().trim_end();
+        assert_eq!(expected, body);
     }
 }

@@ -70,8 +70,7 @@ pub struct EnvVars {
     /// assertions](https://doc.rust-lang.org/reference/conditional-compilation.html#debug_assertions)
     /// are enabled.
     pub allow_non_deterministic_fulltext_search: bool,
-    /// Set by the environment variable `GRAPH_MAX_SPEC_VERSION`. The default
-    /// value is `0.0.7`.
+    /// Set by the environment variable `GRAPH_MAX_SPEC_VERSION`.
     pub max_spec_version: Version,
     /// Set by the environment variable `GRAPH_LOAD_WINDOW_SIZE` (expressed in
     /// seconds). The default value is 300 seconds.
@@ -86,6 +85,9 @@ pub struct EnvVars {
     /// Set by the environment variable
     /// `GRAPH_ELASTIC_SEARCH_MAX_RETRIES`. The default value is 5.
     pub elastic_search_max_retries: usize,
+    /// The name of the index in ElasticSearch to which we should log. Set
+    /// by `GRAPH_ELASTIC_SEARCH_INDEX`. The default is `subgraph`.
+    pub elastic_search_index: String,
     /// If an instrumented lock is contended for longer than the specified
     /// duration, a warning will be logged.
     ///
@@ -119,6 +121,10 @@ pub struct EnvVars {
     pub subgraph_version_switching_mode: SubgraphVersionSwitchingMode,
     /// Set by the flag `GRAPH_KILL_IF_UNRESPONSIVE`. Off by default.
     pub kill_if_unresponsive: bool,
+    /// Max timeout in seconds before killing the node.
+    /// Set by the environment variable `GRAPH_KILL_IF_UNRESPONSIVE_TIMEOUT_SECS`
+    /// (expressed in seconds). The default value is 10s.
+    pub kill_if_unresponsive_timeout: Duration,
     /// Guards public access to POIs in the `index-node`.
     ///
     /// Set by the environment variable `GRAPH_POI_ACCESS_TOKEN`. No default
@@ -143,7 +149,7 @@ pub struct EnvVars {
     pub subgraph_error_retry_jitter: f64,
     /// Experimental feature.
     ///
-    /// Set by the flag `GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES`. Off by
+    /// Set by the flag `GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES`. On by
     /// default.
     pub enable_select_by_specific_attributes: bool,
     /// Verbose logging of mapping inputs.
@@ -172,9 +178,36 @@ pub struct EnvVars {
     /// Set by the environment variable `ETHEREUM_REORG_THRESHOLD`. The default
     /// value is 250 blocks.
     pub reorg_threshold: BlockNumber,
+    /// The time to wait between polls when using polling block ingestor.
+    /// The value is set by `ETHERUM_POLLING_INTERVAL` in millis and the
+    /// default is 1000.
+    pub ingestor_polling_interval: Duration,
     /// Set by the env var `GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS` which should point
     /// to a file with subgraph-specific settings
     pub subgraph_settings: Option<String>,
+    /// Whether to prefer substreams blocks streams over firehose when available.
+    pub prefer_substreams_block_streams: bool,
+    /// Set by the flag `GRAPH_ENABLE_DIPS_METRICS`. Whether to enable
+    /// gas metrics. Off by default.
+    pub enable_dips_metrics: bool,
+    /// Set by the env var `GRAPH_HISTORY_BLOCKS_OVERRIDE`. Defaults to None
+    /// Sets an override for the amount history to keep regardless of the
+    /// historyBlocks set in the manifest
+    pub history_blocks_override: Option<BlockNumber>,
+    /// Set by the env var `GRAPH_MIN_HISTORY_BLOCKS`
+    /// The amount of history to keep when using 'min' historyBlocks
+    /// in the manifest
+    pub min_history_blocks: BlockNumber,
+    /// Set by the env var `dips_metrics_object_store_url`
+    /// The name of the object store bucket to store DIPS metrics
+    pub dips_metrics_object_store_url: Option<String>,
+    /// Write a list of how sections are nested to the file `section_map`
+    /// which must be an absolute path. This only has an effect in debug
+    /// builds. Set with `GRAPH_SECTION_MAP`. Defaults to `None`.
+    pub section_map: Option<String>,
+    /// Set the maximum grpc decode size(in MB) for firehose BlockIngestor connections.
+    /// Defaults to 25MB
+    pub firehose_grpc_max_decode_size_mb: usize,
 }
 
 impl EnvVars {
@@ -183,6 +216,16 @@ impl EnvVars {
         let graphql = InnerGraphQl::init_from_env()?.into();
         let mapping_handlers = InnerMappingHandlers::init_from_env()?.into();
         let store = InnerStore::init_from_env()?.into();
+
+        // The default reorganization (reorg) threshold is set to 250.
+        // For testing purposes, we need to set this threshold to 0 because:
+        // 1. Many tests involve reverting blocks.
+        // 2. Blocks cannot be reverted below the reorg threshold.
+        // Therefore, during tests, we want to set the reorg threshold to 0.
+        let reorg_threshold =
+            inner
+                .reorg_threshold
+                .unwrap_or_else(|| if cfg!(debug_assertions) { 0 } else { 250 });
 
         Ok(Self {
             graphql,
@@ -203,6 +246,7 @@ impl EnvVars {
                 inner.elastic_search_flush_interval_in_secs,
             ),
             elastic_search_max_retries: inner.elastic_search_max_retries,
+            elastic_search_index: inner.elastic_search_index,
             lock_contention_log_threshold: Duration::from_millis(
                 inner.lock_contention_log_threshold_in_ms,
             ),
@@ -218,6 +262,9 @@ impl EnvVars {
             experimental_static_filters: inner.experimental_static_filters.0,
             subgraph_version_switching_mode: inner.subgraph_version_switching_mode,
             kill_if_unresponsive: inner.kill_if_unresponsive.0,
+            kill_if_unresponsive_timeout: Duration::from_secs(
+                inner.kill_if_unresponsive_timeout_secs,
+            ),
             poi_access_token: inner.poi_access_token,
             subgraph_max_data_sources: inner.subgraph_max_data_sources.0,
             disable_fail_fast: inner.disable_fail_fast.0,
@@ -231,8 +278,16 @@ impl EnvVars {
             external_http_base_url: inner.external_http_base_url,
             external_ws_base_url: inner.external_ws_base_url,
             static_filters_threshold: inner.static_filters_threshold,
-            reorg_threshold: inner.reorg_threshold,
+            reorg_threshold,
+            ingestor_polling_interval: Duration::from_millis(inner.ingestor_polling_interval),
             subgraph_settings: inner.subgraph_settings,
+            prefer_substreams_block_streams: inner.prefer_substreams_block_streams,
+            enable_dips_metrics: inner.enable_dips_metrics.0,
+            history_blocks_override: inner.history_blocks_override,
+            min_history_blocks: inner.min_history_blocks.unwrap_or(2 * reorg_threshold),
+            dips_metrics_object_store_url: inner.dips_metrics_object_store_url,
+            section_map: inner.section_map,
+            firehose_grpc_max_decode_size_mb: inner.firehose_grpc_max_decode_size_mb,
         })
     }
 
@@ -285,7 +340,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "0.0.7")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.2.0")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_LOAD_WINDOW_SIZE", default = "300")]
     load_window_size_in_secs: u64,
@@ -295,6 +350,8 @@ struct Inner {
     elastic_search_flush_interval_in_secs: u64,
     #[envconfig(from = "GRAPH_ELASTIC_SEARCH_MAX_RETRIES", default = "5")]
     elastic_search_max_retries: usize,
+    #[envconfig(from = "GRAPH_ELASTIC_SEARCH_INDEX", default = "subgraph")]
+    elastic_search_index: String,
     #[envconfig(from = "GRAPH_LOCK_CONTENTION_LOG_THRESHOLD_MS", default = "100")]
     lock_contention_log_threshold_in_ms: u64,
 
@@ -322,6 +379,8 @@ struct Inner {
     subgraph_version_switching_mode: SubgraphVersionSwitchingMode,
     #[envconfig(from = "GRAPH_KILL_IF_UNRESPONSIVE", default = "false")]
     kill_if_unresponsive: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_KILL_IF_UNRESPONSIVE_TIMEOUT_SECS", default = "10")]
+    kill_if_unresponsive_timeout_secs: u64,
     #[envconfig(from = "GRAPH_POI_ACCESS_TOKEN")]
     poi_access_token: Option<String>,
     #[envconfig(from = "GRAPH_SUBGRAPH_MAX_DATA_SOURCES", default = "1_000_000_000")]
@@ -332,7 +391,7 @@ struct Inner {
     subgraph_error_retry_ceil_in_secs: u64,
     #[envconfig(from = "GRAPH_SUBGRAPH_ERROR_RETRY_JITTER", default = "0.2")]
     subgraph_error_retry_jitter: f64,
-    #[envconfig(from = "GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES", default = "false")]
+    #[envconfig(from = "GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES", default = "true")]
     enable_select_by_specific_attributes: EnvVarBoolean,
     #[envconfig(from = "GRAPH_LOG_TRIGGER_DATA", default = "false")]
     log_trigger_data: EnvVarBoolean,
@@ -349,10 +408,29 @@ struct Inner {
     #[envconfig(from = "GRAPH_STATIC_FILTERS_THRESHOLD", default = "10000")]
     static_filters_threshold: usize,
     // JSON-RPC specific.
-    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD", default = "250")]
-    reorg_threshold: BlockNumber,
+    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD")]
+    reorg_threshold: Option<BlockNumber>,
+    #[envconfig(from = "ETHEREUM_POLLING_INTERVAL", default = "1000")]
+    ingestor_polling_interval: u64,
     #[envconfig(from = "GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS")]
     subgraph_settings: Option<String>,
+    #[envconfig(
+        from = "GRAPH_EXPERIMENTAL_PREFER_SUBSTREAMS_BLOCK_STREAMS",
+        default = "false"
+    )]
+    prefer_substreams_block_streams: bool,
+    #[envconfig(from = "GRAPH_ENABLE_DIPS_METRICS", default = "false")]
+    enable_dips_metrics: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_HISTORY_BLOCKS_OVERRIDE")]
+    history_blocks_override: Option<BlockNumber>,
+    #[envconfig(from = "GRAPH_MIN_HISTORY_BLOCKS")]
+    min_history_blocks: Option<BlockNumber>,
+    #[envconfig(from = "GRAPH_DIPS_METRICS_OBJECT_STORE_URL")]
+    dips_metrics_object_store_url: Option<String>,
+    #[envconfig(from = "GRAPH_SECTION_MAP")]
+    section_map: Option<String>,
+    #[envconfig(from = "GRAPH_NODE_FIREHOSE_MAX_DECODE_SIZE", default = "25")]
+    firehose_grpc_max_decode_size_mb: usize,
 }
 
 #[derive(Clone, Debug)]

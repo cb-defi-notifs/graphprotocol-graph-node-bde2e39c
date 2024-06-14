@@ -1,6 +1,6 @@
-use super::{BlockNumber, DeploymentHash, DeploymentSchemaVersion};
+use super::{BlockNumber, DeploymentSchemaVersion};
 use crate::prelude::QueryExecutionError;
-use crate::util::intern::Error as InternError;
+use crate::{data::store::EntityValidationError, prelude::DeploymentHash};
 
 use anyhow::{anyhow, Error};
 use diesel::result::Error as DieselError;
@@ -11,13 +11,15 @@ use tokio::task::JoinError;
 pub enum StoreError {
     #[error("store error: {0:#}")]
     Unknown(Error),
+    #[error("Entity validation failed: {0}")]
+    EntityValidationError(EntityValidationError),
     #[error(
         "tried to set entity of type `{0}` with ID \"{1}\" but an entity of type `{2}`, \
          which has an interface in common with `{0}`, exists with the same ID"
     )]
     ConflictingId(String, String, String), // (entity, id, conflicting_entity)
-    #[error("unknown field '{0}'")]
-    UnknownField(String),
+    #[error("table '{0}' does not have a field '{1}'")]
+    UnknownField(String, String),
     #[error("unknown table '{0}'")]
     UnknownTable(String),
     #[error("entity type '{0}' does not have an attribute '{0}'")]
@@ -26,6 +28,8 @@ pub enum StoreError {
     MalformedDirective(String),
     #[error("query execution failed: {0}")]
     QueryExecutionError(String),
+    #[error("Child filter nesting not supported by value `{0}`: `{1}`")]
+    ChildFilterNestingNotSupportedError(String, String),
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
     #[error(
@@ -44,6 +48,8 @@ pub enum StoreError {
     UnknownShard(String),
     #[error("Fulltext search not yet deterministic")]
     FulltextSearchNonDeterministic,
+    #[error("Fulltext search column missing configuration")]
+    FulltextColumnMissingConfig,
     #[error("operation was canceled")]
     Canceled,
     #[error("database unavailable")]
@@ -64,16 +70,20 @@ pub enum StoreError {
     UnsupportedDeploymentSchemaVersion(i32),
     #[error("pruning failed: {0}")]
     PruneFailure(String),
+    #[error("unsupported filter `{0}` for value `{1}`")]
+    UnsupportedFilter(String, String),
+    #[error("writing {0} entities at block {1} failed: {2} Query: {3}")]
+    WriteFailure(String, BlockNumber, String, String),
 }
 
 // Convenience to report a constraint violation
 #[macro_export]
 macro_rules! constraint_violation {
     ($msg:expr) => {{
-        StoreError::ConstraintViolation(format!("{}", $msg))
+        $crate::prelude::StoreError::ConstraintViolation(format!("{}", $msg))
     }};
     ($fmt:expr, $($arg:tt)*) => {{
-        StoreError::ConstraintViolation(format!($fmt, $($arg)*))
+        $crate::prelude::StoreError::ConstraintViolation(format!($fmt, $($arg)*))
     }}
 }
 
@@ -84,16 +94,20 @@ impl Clone for StoreError {
     fn clone(&self) -> Self {
         match self {
             Self::Unknown(arg0) => Self::Unknown(anyhow!("{}", arg0)),
+            Self::EntityValidationError(arg0) => Self::EntityValidationError(arg0.clone()),
             Self::ConflictingId(arg0, arg1, arg2) => {
                 Self::ConflictingId(arg0.clone(), arg1.clone(), arg2.clone())
             }
-            Self::UnknownField(arg0) => Self::UnknownField(arg0.clone()),
+            Self::UnknownField(arg0, arg1) => Self::UnknownField(arg0.clone(), arg1.clone()),
             Self::UnknownTable(arg0) => Self::UnknownTable(arg0.clone()),
             Self::UnknownAttribute(arg0, arg1) => {
                 Self::UnknownAttribute(arg0.clone(), arg1.clone())
             }
             Self::MalformedDirective(arg0) => Self::MalformedDirective(arg0.clone()),
             Self::QueryExecutionError(arg0) => Self::QueryExecutionError(arg0.clone()),
+            Self::ChildFilterNestingNotSupportedError(arg0, arg1) => {
+                Self::ChildFilterNestingNotSupportedError(arg0.clone(), arg1.clone())
+            }
             Self::InvalidIdentifier(arg0) => Self::InvalidIdentifier(arg0.clone()),
             Self::DuplicateBlockProcessing(arg0, arg1) => {
                 Self::DuplicateBlockProcessing(arg0.clone(), arg1.clone())
@@ -102,6 +116,7 @@ impl Clone for StoreError {
             Self::DeploymentNotFound(arg0) => Self::DeploymentNotFound(arg0.clone()),
             Self::UnknownShard(arg0) => Self::UnknownShard(arg0.clone()),
             Self::FulltextSearchNonDeterministic => Self::FulltextSearchNonDeterministic,
+            Self::FulltextColumnMissingConfig => Self::FulltextColumnMissingConfig,
             Self::Canceled => Self::Canceled,
             Self::DatabaseUnavailable => Self::DatabaseUnavailable,
             Self::DatabaseDisabled => Self::DatabaseDisabled,
@@ -112,25 +127,52 @@ impl Clone for StoreError {
                 Self::UnsupportedDeploymentSchemaVersion(arg0.clone())
             }
             Self::PruneFailure(arg0) => Self::PruneFailure(arg0.clone()),
+            Self::UnsupportedFilter(arg0, arg1) => {
+                Self::UnsupportedFilter(arg0.clone(), arg1.clone())
+            }
+            Self::WriteFailure(arg0, arg1, arg2, arg3) => {
+                Self::WriteFailure(arg0.clone(), arg1.clone(), arg2.clone(), arg3.clone())
+            }
+        }
+    }
+}
+
+impl StoreError {
+    fn database_unavailable(e: &DieselError) -> Option<Self> {
+        // When the error is caused by a closed connection, treat the error
+        // as 'database unavailable'. When this happens during indexing, the
+        // indexing machinery will retry in that case rather than fail the
+        // subgraph
+        if let DieselError::DatabaseError(_, info) = e {
+            if info
+                .message()
+                .contains("server closed the connection unexpectedly")
+            {
+                return Some(Self::DatabaseUnavailable);
+            }
+        }
+        None
+    }
+
+    pub fn write_failure(
+        error: DieselError,
+        entity: &str,
+        block: BlockNumber,
+        query: String,
+    ) -> Self {
+        match Self::database_unavailable(&error) {
+            Some(e) => return e,
+            None => StoreError::WriteFailure(entity.to_string(), block, error.to_string(), query),
         }
     }
 }
 
 impl From<DieselError> for StoreError {
     fn from(e: DieselError) -> Self {
-        // When the error is caused by a closed connection, treat the error
-        // as 'database unavailable'. When this happens during indexing, the
-        // indexing machinery will retry in that case rather than fail the
-        // subgraph
-        if let DieselError::DatabaseError(_, info) = &e {
-            if info
-                .message()
-                .contains("server closed the connection unexpectedly")
-            {
-                return StoreError::DatabaseUnavailable;
-            }
+        match Self::database_unavailable(&e) {
+            Some(e) => return e,
+            None => StoreError::Unknown(e.into()),
         }
-        StoreError::Unknown(e.into())
     }
 }
 
@@ -161,13 +203,5 @@ impl From<QueryExecutionError> for StoreError {
 impl From<std::fmt::Error> for StoreError {
     fn from(e: std::fmt::Error) -> Self {
         StoreError::Unknown(anyhow!("{}", e.to_string()))
-    }
-}
-
-impl From<InternError> for StoreError {
-    fn from(e: InternError) -> Self {
-        match e {
-            InternError::NotInterned(key) => StoreError::UnknownField(key),
-        }
     }
 }

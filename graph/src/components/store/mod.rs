@@ -3,120 +3,42 @@ mod err;
 mod traits;
 pub mod write;
 
-pub use entity_cache::{EntityCache, GetScope, ModificationsAndCache};
+pub use entity_cache::{EntityCache, EntityLfuCache, GetScope, ModificationsAndCache};
+use futures03::future::{FutureExt, TryFutureExt};
+use slog::{trace, Logger};
 
-use diesel::types::{FromSql, ToSql};
+pub use super::subgraph::Entity;
 pub use err::StoreError;
 use itertools::Itertools;
 use strum_macros::Display;
 pub use traits::*;
 pub use write::Batch;
 
-use futures::stream::poll_fn;
-use futures::{Async, Poll, Stream};
-use graphql_parser::schema as s;
+use futures01::stream::poll_fn;
+use futures01::{Async, Poll, Stream};
 use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use std::{fmt, io};
 
-use crate::blockchain::Block;
+use crate::blockchain::{Block, BlockHash, BlockPtr};
+use crate::cheap_clone::CheapClone;
 use crate::components::store::write::EntityModification;
+use crate::constraint_violation;
 use crate::data::store::scalar::Bytes;
-use crate::data::store::*;
+use crate::data::store::{Id, IdList, Value};
 use crate::data::value::Word;
 use crate::data_source::CausalityRegion;
-use crate::schema::InputSchema;
-use crate::util::intern;
-use crate::{constraint_violation, prelude::*};
+use crate::derive::CheapClone;
+use crate::env::ENV_VARS;
+use crate::prelude::{s, Attribute, DeploymentHash, SubscriptionFilter, ValueType};
+use crate::schema::{ast as sast, EntityKey, EntityType, InputSchema};
+use crate::util::stats::MovingStats;
 
-/// The type name of an entity. This is the string that is used in the
-/// subgraph's GraphQL schema as `type NAME @entity { .. }`
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntityType(Word);
-
-impl EntityType {
-    /// Construct a new entity type. Ideally, this is only called when
-    /// `entity_type` either comes from the GraphQL schema, or from
-    /// the database from fields that are known to contain a valid entity type
-    pub fn new(entity_type: String) -> Self {
-        Self(entity_type.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-
-    pub fn into_string(self) -> String {
-        self.0.to_string()
-    }
-
-    pub fn is_poi(&self) -> bool {
-        self.0.as_str() == "Poi$"
-    }
-}
-
-impl fmt::Display for EntityType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl<'a> From<&s::ObjectType<'a, String>> for EntityType {
-    fn from(object_type: &s::ObjectType<'a, String>) -> Self {
-        EntityType::new(object_type.name.clone())
-    }
-}
-
-impl<'a> From<&s::InterfaceType<'a, String>> for EntityType {
-    fn from(interface_type: &s::InterfaceType<'a, String>) -> Self {
-        EntityType::new(interface_type.name.clone())
-    }
-}
-
-impl Borrow<str> for EntityType {
-    fn borrow(&self) -> &str {
-        &self.0
-    }
-}
-
-// This conversion should only be used in tests since it makes it too
-// easy to convert random strings into entity types
-#[cfg(debug_assertions)]
-impl From<&str> for EntityType {
-    fn from(s: &str) -> Self {
-        EntityType::new(s.to_owned())
-    }
-}
-
-impl CheapClone for EntityType {}
-
-impl FromSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
-    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
-        let s = <String as FromSql<_, diesel::pg::Pg>>::from_sql(bytes)?;
-        Ok(EntityType::new(s))
-    }
-}
-
-impl ToSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
-    fn to_sql<W: io::Write>(
-        &self,
-        out: &mut diesel::serialize::Output<W, diesel::pg::Pg>,
-    ) -> diesel::serialize::Result {
-        <str as ToSql<diesel::sql_types::Text, diesel::pg::Pg>>::to_sql(self.0.as_str(), out)
-    }
-}
-
-impl std::fmt::Debug for EntityType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "EntityType({})", self.0)
-    }
-}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityFilterDerivative(bool);
 
@@ -130,45 +52,12 @@ impl EntityFilterDerivative {
     }
 }
 
-/// Key by which an individual entity in the store can be accessed. Stores
-/// only the entity type and id. The deployment must be known from context.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntityKey {
-    /// Name of the entity type.
-    pub entity_type: EntityType,
-
-    /// ID of the individual entity.
-    pub entity_id: Word,
-
-    /// This is the causality region of the data source that created the entity.
-    ///
-    /// In the case of an entity lookup, this is the causality region of the data source that is
-    /// doing the lookup. So if the entity exists but was created on a different causality region,
-    /// the lookup will return empty.
-    pub causality_region: CausalityRegion,
-}
-
-impl EntityKey {
-    pub fn unknown_attribute(&self, err: intern::Error) -> StoreError {
-        StoreError::UnknownAttribute(self.entity_type.to_string(), err.not_interned())
-    }
-}
-
-impl std::fmt::Debug for EntityKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "EntityKey({}[{}], cr={})",
-            self.entity_type, self.entity_id, self.causality_region
-        )
-    }
-}
 #[derive(Debug, Clone)]
 pub struct LoadRelatedRequest {
     /// Name of the entity type.
     pub entity_type: EntityType,
     /// ID of the individual entity.
-    pub entity_id: Word,
+    pub entity_id: Id,
     /// Field the shall be loaded
     pub entity_field: Word,
 
@@ -187,7 +76,7 @@ pub struct DerivedEntityQuery {
     /// The field to check
     pub entity_field: Word,
     /// The value to compare against
-    pub value: Word,
+    pub value: Id,
 
     /// This is the causality region of the data source that created the entity.
     ///
@@ -197,24 +86,14 @@ pub struct DerivedEntityQuery {
     pub causality_region: CausalityRegion,
 }
 
-impl EntityKey {
-    // For use in tests only
-    #[cfg(debug_assertions)]
-    pub fn data(entity_type: impl Into<String>, entity_id: impl Into<String>) -> Self {
-        Self {
-            entity_type: EntityType::new(entity_type.into()),
-            entity_id: entity_id.into().into(),
-            causality_region: CausalityRegion::ONCHAIN,
-        }
-    }
-
-    pub fn from(id: &String, load_related_request: &LoadRelatedRequest) -> Self {
-        let clone = load_related_request.clone();
-        Self {
-            entity_id: id.clone().into(),
-            entity_type: clone.entity_type,
-            causality_region: clone.causality_region,
-        }
+impl DerivedEntityQuery {
+    /// Checks if a given key and entity match this query.
+    pub fn matches(&self, key: &EntityKey, entity: &Entity) -> bool {
+        key.entity_type == self.entity_type
+            && entity
+                .get(&self.entity_field)
+                .map(|v| &self.value == v)
+                .unwrap_or(false)
     }
 }
 
@@ -391,10 +270,23 @@ pub struct EntityRange {
 }
 
 impl EntityRange {
+    /// The default value for `first` that we use when the user doesn't
+    /// specify one
+    pub const FIRST: u32 = 100;
+
     /// Query for the first `n` entities.
     pub fn first(n: u32) -> Self {
         Self {
             first: Some(n),
+            skip: 0,
+        }
+    }
+}
+
+impl std::default::Default for EntityRange {
+    fn default() -> Self {
+        Self {
+            first: Some(Self::FIRST),
             skip: 0,
         }
     }
@@ -425,11 +317,11 @@ impl WindowAttribute {
 pub enum ParentLink {
     /// The parent stores a list of child ids. The ith entry in the outer
     /// vector contains the id of the children for `EntityWindow.ids[i]`
-    List(Vec<Vec<String>>),
+    List(Vec<IdList>),
     /// The parent stores the id of one child. The ith entry in the
     /// vector contains the id of the child of the parent with id
     /// `EntityWindow.ids[i]`
-    Scalar(Vec<String>),
+    Scalar(IdList),
 }
 
 /// How many children a parent can have when the child stores
@@ -438,6 +330,16 @@ pub enum ParentLink {
 pub enum ChildMultiplicity {
     Single,
     Many,
+}
+
+impl ChildMultiplicity {
+    pub fn new(field: &s::Field) -> Self {
+        if sast::is_list_or_non_null_list_field(field) {
+            ChildMultiplicity::Many
+        } else {
+            ChildMultiplicity::Single
+        }
+    }
 }
 
 /// How to select children for their parents depending on whether the
@@ -465,7 +367,7 @@ pub struct EntityWindow {
     /// The entity type for this window
     pub child_type: EntityType,
     /// The ids of parents that should be considered for this window
-    pub ids: Vec<String>,
+    pub ids: IdList,
     /// How to get the parent id
     pub link: EntityLink,
     pub column_names: AttributeNames,
@@ -572,7 +474,7 @@ impl EntityQuery {
             collection,
             filter: None,
             order: EntityOrder::Default,
-            range: EntityRange::first(100),
+            range: EntityRange::default(),
             logger: None,
             query_id: None,
             trace: false,
@@ -613,7 +515,7 @@ impl EntityQuery {
             if windows.len() == 1 {
                 let window = windows.first().expect("we just checked");
                 if window.ids.len() == 1 {
-                    let id = window.ids.first().expect("we just checked");
+                    let id = window.ids.first().expect("we just checked").to_value();
                     if let EntityLink::Direct(attribute, _) = &window.link {
                         let filter = match attribute {
                             WindowAttribute::Scalar(name) => {
@@ -652,7 +554,7 @@ pub enum EntityChange {
     Data {
         subgraph_id: DeploymentHash,
         /// Entity type name of the changed entity.
-        entity_type: EntityType,
+        entity_type: String,
     },
     Assignment {
         deployment: DeploymentLocator,
@@ -664,7 +566,7 @@ impl EntityChange {
     pub fn for_data(subgraph_id: DeploymentHash, key: EntityKey) -> Self {
         Self::Data {
             subgraph_id,
-            entity_type: key.entity_type,
+            entity_type: key.entity_type.to_string(),
         }
     }
 
@@ -675,14 +577,17 @@ impl EntityChange {
         }
     }
 
-    pub fn as_filter(&self) -> SubscriptionFilter {
+    pub fn as_filter(&self, schema: &InputSchema) -> SubscriptionFilter {
         use EntityChange::*;
         match self {
             Data {
                 subgraph_id,
                 entity_type,
                 ..
-            } => SubscriptionFilter::Entities(subgraph_id.clone(), entity_type.clone()),
+            } => SubscriptionFilter::Entities(
+                subgraph_id.clone(),
+                schema.entity_type(entity_type).unwrap(),
+            ),
             Assignment { .. } => SubscriptionFilter::Assignment,
         }
     }
@@ -742,7 +647,7 @@ impl StoreEvent {
                     .into_iter()
                     .map(|entity_type| EntityChange::Data {
                         subgraph_id: deployment.clone(),
-                        entity_type,
+                        entity_type: entity_type.to_string(),
                     }),
             );
         Self::from_set(changes)
@@ -872,7 +777,7 @@ where
 
             // Check if interval has passed since the last time we sent something.
             // If it has, start a new delay timer
-            let should_send = match futures::future::Future::poll(&mut delay) {
+            let should_send = match futures01::future::Future::poll(&mut delay) {
                 Ok(Async::NotReady) => false,
                 // Timer errors are harmless. Treat them as if the timer had
                 // become ready.
@@ -949,7 +854,7 @@ pub struct StoredDynamicDataSource {
 /// identifier only has meaning in the context of a specific instance of
 /// graph-node. Only store code should ever construct or consume it; all
 /// other code passes it around as an opaque token.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, CheapClone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DeploymentId(pub i32);
 
 impl Display for DeploymentId {
@@ -968,13 +873,11 @@ impl DeploymentId {
 /// identifier (`hash`) and its unique internal identifier (`id`) which
 /// ensures we are talking about a unique location for the deployment's data
 /// in the store
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, CheapClone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DeploymentLocator {
     pub id: DeploymentId,
     pub hash: DeploymentHash,
 }
-
-impl CheapClone for DeploymentLocator {}
 
 impl slog::Value for DeploymentLocator {
     fn serialize(
@@ -1116,11 +1019,11 @@ impl fmt::Display for DeploymentSchemaVersion {
 
 /// A `ReadStore` that is always empty.
 pub struct EmptyStore {
-    schema: Arc<InputSchema>,
+    schema: InputSchema,
 }
 
 impl EmptyStore {
-    pub fn new(schema: Arc<InputSchema>) -> Self {
+    pub fn new(schema: InputSchema) -> Self {
         EmptyStore { schema }
     }
 }
@@ -1141,7 +1044,7 @@ impl ReadStore for EmptyStore {
         Ok(BTreeMap::new())
     }
 
-    fn input_schema(&self) -> Arc<InputSchema> {
+    fn input_schema(&self) -> InputSchema {
         self.schema.cheap_clone()
     }
 }
@@ -1150,8 +1053,8 @@ impl ReadStore for EmptyStore {
 /// in a database table
 #[derive(Clone, Debug)]
 pub struct VersionStats {
-    pub entities: i32,
-    pub versions: i32,
+    pub entities: i64,
+    pub versions: i64,
     pub tablename: String,
     /// The ratio `entities / versions`
     pub ratio: f64,

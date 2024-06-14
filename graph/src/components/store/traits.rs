@@ -1,14 +1,23 @@
+use std::collections::HashMap;
+
+use anyhow::Error;
+use async_trait::async_trait;
 use web3::types::{Address, H256};
 
 use super::*;
 use crate::blockchain::block_stream::FirehoseCursor;
+use crate::blockchain::{BlockTime, ChainIdentifier};
+use crate::components::metrics::stopwatch::StopwatchMetrics;
 use crate::components::server::index_node::VersionInfo;
+use crate::components::subgraph::SubgraphVersionSwitchingMode;
 use crate::components::transaction_receipt;
 use crate::components::versions::ApiVersion;
 use crate::data::query::Trace;
+use crate::data::store::ethereum::call;
+use crate::data::store::QueryObject;
 use crate::data::subgraph::{status, DeploymentFeatures};
-use crate::data::value::Object;
 use crate::data::{query::QueryTarget, subgraph::schema::*};
+use crate::prelude::{DeploymentState, NodeId, QueryExecutionError, SubgraphName};
 use crate::schema::{ApiSchema, InputSchema};
 
 pub trait SubscriptionManager: Send + Sync + 'static {
@@ -101,6 +110,10 @@ pub trait SubgraphStore: Send + Sync + 'static {
         node_id: &NodeId,
     ) -> Result<(), StoreError>;
 
+    fn pause_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
+
+    fn resume_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
+
     fn assigned_node(&self, deployment: &DeploymentLocator) -> Result<Option<NodeId>, StoreError>;
 
     /// Returns Option<(node_id,is_paused)> where `node_id` is the node that
@@ -132,7 +145,7 @@ pub trait SubgraphStore: Send + Sync + 'static {
     ) -> Result<Vec<EntityOperation>, StoreError>;
 
     /// Return the GraphQL schema supplied by the user
-    fn input_schema(&self, subgraph_id: &DeploymentHash) -> Result<Arc<InputSchema>, StoreError>;
+    fn input_schema(&self, subgraph_id: &DeploymentHash) -> Result<InputSchema, StoreError>;
 
     /// Return a bool represeting whether there is a pending graft for the subgraph
     fn graft_pending(&self, id: &DeploymentHash) -> Result<bool, StoreError>;
@@ -220,7 +233,7 @@ pub trait ReadStore: Send + Sync + 'static {
         query_derived: &DerivedEntityQuery,
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError>;
 
-    fn input_schema(&self) -> Arc<InputSchema>;
+    fn input_schema(&self) -> InputSchema;
 }
 
 // This silly impl is needed until https://github.com/rust-lang/rust/issues/65991 is stable.
@@ -243,12 +256,14 @@ impl<T: ?Sized + ReadStore> ReadStore for Arc<T> {
         (**self).get_derived(entity_derived)
     }
 
-    fn input_schema(&self) -> Arc<InputSchema> {
+    fn input_schema(&self) -> InputSchema {
         (**self).input_schema()
     }
 }
 
 pub trait DeploymentCursorTracker: Sync + Send + 'static {
+    fn input_schema(&self) -> InputSchema;
+
     /// Get a pointer to the most recently processed block in the subgraph.
     fn block_ptr(&self) -> Option<BlockPtr>;
 
@@ -265,6 +280,10 @@ impl<T: ?Sized + DeploymentCursorTracker> DeploymentCursorTracker for Arc<T> {
 
     fn firehose_cursor(&self) -> FirehoseCursor {
         (**self).firehose_cursor()
+    }
+
+    fn input_schema(&self) -> InputSchema {
+        (**self).input_schema()
     }
 }
 
@@ -311,9 +330,15 @@ pub trait WritableStore: ReadStore + DeploymentCursorTracker {
     /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
     /// `block_ptr_to` must point to a child block of the current subgraph block pointer.
+    ///
+    /// `is_caught_up_with_chain_head` indicates if `block_ptr_to` is close enough to the chain head
+    /// to be considered 'caught up', for purposes such as setting the synced flag or turning off
+    /// write batching. This is as vague as it sounds, it is not deterministic and should be treated
+    /// as a hint only.
     async fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
+        block_time: BlockTime,
         firehose_cursor: FirehoseCursor,
         mods: Vec<EntityModification>,
         stopwatch: &StopwatchMetrics,
@@ -321,16 +346,15 @@ pub trait WritableStore: ReadStore + DeploymentCursorTracker {
         deterministic_errors: Vec<SubgraphError>,
         offchain_to_remove: Vec<StoredDynamicDataSource>,
         is_non_fatal_errors_active: bool,
+        is_caught_up_with_chain_head: bool,
     ) -> Result<(), StoreError>;
 
-    /// The deployment `id` finished syncing, mark it as synced in the database
-    /// and promote it to the current version in the subgraphs where it was the
-    /// pending version so far
+    /// Force synced status, used for testing.
     fn deployment_synced(&self) -> Result<(), StoreError>;
 
-    /// Return true if the deployment with the given id is fully synced,
-    /// and return false otherwise. Errors from the store are passed back up
-    async fn is_deployment_synced(&self) -> Result<bool, StoreError>;
+    /// Return true if the deployment with the given id is fully synced, and return false otherwise.
+    /// Cheap, cached operation.
+    fn is_deployment_synced(&self) -> bool;
 
     fn unassign_subgraph(&self) -> Result<(), StoreError>;
 
@@ -428,9 +452,6 @@ pub trait ChainStore: Send + Sync + 'static {
     /// The head block pointer will be None on initial set up.
     async fn chain_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error>;
 
-    /// In-memory time cached version of `chain_head_ptr`.
-    async fn cached_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error>;
-
     /// Get the current head block cursor for this chain.
     ///
     /// The head block cursor will be None on initial set up.
@@ -447,17 +468,30 @@ pub trait ChainStore: Send + Sync + 'static {
     ) -> Result<(), Error>;
 
     /// Returns the blocks present in the store.
-    fn blocks(&self, hashes: &[BlockHash]) -> Result<Vec<serde_json::Value>, Error>;
+    async fn blocks(
+        self: Arc<Self>,
+        hashes: Vec<BlockHash>,
+    ) -> Result<Vec<serde_json::Value>, Error>;
 
     /// Get the `offset`th ancestor of `block_hash`, where offset=0 means the block matching
-    /// `block_hash` and offset=1 means its parent. Returns None if unable to complete due to
-    /// missing blocks in the chain store.
+    /// `block_hash` and offset=1 means its parent. If `root` is passed, short-circuit upon finding
+    /// a child of `root`. Returns None if unable to complete due to missing blocks in the chain
+    /// store.
+    ///
+    /// The short-circuit mechanism is particularly useful in situations where blocks are skipped
+    /// in certain chains like Filecoin EVM. In such cases, relying solely on the numeric offset
+    /// might lead to inaccuracies because block numbers could be non-sequential. By allowing a
+    /// `root` block hash as a reference, the function can more accurately identify the desired
+    /// ancestor by stopping the search as soon as it discovers a block that is a direct child
+    /// of the `root` (i.e., when block.parent_hash equals root.hash). This approach ensures
+    /// the correct ancestor block is identified without solely depending on the offset.
     ///
     /// Returns an error if the offset would reach past the genesis block.
     async fn ancestor_block(
         self: Arc<Self>,
         block_ptr: BlockPtr,
         offset: BlockNumber,
+        root: Option<BlockHash>,
     ) -> Result<Option<serde_json::Value>, Error>;
 
     /// Remove old blocks from the cache we maintain in the database and
@@ -477,14 +511,20 @@ pub trait ChainStore: Send + Sync + 'static {
     /// may purge any other blocks with that number
     fn confirm_block_hash(&self, number: BlockNumber, hash: &BlockHash) -> Result<usize, Error>;
 
-    /// Find the block with `block_hash` and return the network name, number and timestamp if present.
+    /// Find the block with `block_hash` and return the network name, number, timestamp and parentHash if present.
     /// Currently, the timestamp is only returned if it's present in the top level block. This format is
     /// depends on the chain and the implementation of Blockchain::Block for the specific chain.
     /// eg: {"block": { "timestamp": 123123123 } }
     async fn block_number(
         &self,
         hash: &BlockHash,
-    ) -> Result<Option<(String, BlockNumber, Option<u64>)>, StoreError>;
+    ) -> Result<Option<(String, BlockNumber, Option<u64>, Option<BlockHash>)>, StoreError>;
+
+    /// Do the same lookup as `block_number`, but in bulk
+    async fn block_numbers(
+        &self,
+        hashes: Vec<BlockHash>,
+    ) -> Result<HashMap<BlockHash, BlockNumber>, StoreError>;
 
     /// Tries to retrieve all transactions receipts for a given block.
     async fn transaction_receipts_in_block(
@@ -494,17 +534,29 @@ pub trait ChainStore: Send + Sync + 'static {
 
     /// Clears call cache of the chain for the given `from` and `to` block number.
     async fn clear_call_cache(&self, from: BlockNumber, to: BlockNumber) -> Result<(), Error>;
+
+    /// Return the chain identifier for this store.
+    fn chain_identifier(&self) -> &ChainIdentifier;
 }
 
 pub trait EthereumCallCache: Send + Sync + 'static {
-    /// Returns the return value of the provided Ethereum call, if present in
-    /// the cache.
+    /// Returns the return value of the provided Ethereum call, if present
+    /// in the cache. A return of `None` indicates that we know nothing
+    /// about the call.
     fn get_call(
         &self,
-        contract_address: ethabi::Address,
-        encoded_call: &[u8],
+        call: &call::Request,
         block: BlockPtr,
-    ) -> Result<Option<Vec<u8>>, Error>;
+    ) -> Result<Option<call::Response>, Error>;
+
+    /// Get the return values of many Ethereum calls. For the ones found in
+    /// the cache, return a `Response`; the ones that were not found are
+    /// returned as the original `Request`
+    fn get_calls(
+        &self,
+        reqs: &[call::Request],
+        block: BlockPtr,
+    ) -> Result<(Vec<call::Response>, Vec<call::Request>), Error>;
 
     /// Returns all cached calls for a given `block`. This method does *not*
     /// update the last access time of the returned cached calls.
@@ -513,11 +565,16 @@ pub trait EthereumCallCache: Send + Sync + 'static {
     /// Stores the provided Ethereum call in the cache.
     fn set_call(
         &self,
-        contract_address: ethabi::Address,
-        encoded_call: &[u8],
+        logger: &Logger,
+        call: call::Request,
         block: BlockPtr,
-        return_value: &[u8],
+        return_value: call::Retval,
     ) -> Result<(), Error>;
+}
+
+pub struct QueryPermit {
+    pub permit: tokio::sync::OwnedSemaphorePermit,
+    pub wait: Duration,
 }
 
 /// Store operations used when serving queries for a specific deployment
@@ -526,7 +583,7 @@ pub trait QueryStore: Send + Sync {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<(Vec<Object>, Trace), QueryExecutionError>;
+    ) -> Result<(Vec<QueryObject>, Trace), QueryExecutionError>;
 
     async fn is_deployment_synced(&self) -> Result<bool, Error>;
 
@@ -535,17 +592,20 @@ pub trait QueryStore: Send + Sync {
     async fn block_number(&self, block_hash: &BlockHash)
         -> Result<Option<BlockNumber>, StoreError>;
 
-    /// Returns the blocknumber as well as the timestamp. Timestamp depends on the chain block type
+    async fn block_numbers(
+        &self,
+        block_hashes: Vec<BlockHash>,
+    ) -> Result<HashMap<BlockHash, BlockNumber>, StoreError>;
+
+    /// Returns the blocknumber, timestamp and the parentHash. Timestamp depends on the chain block type
     /// and can have multiple formats, it can also not be prevent. For now this is only available
     /// for EVM chains both firehose and rpc.
-    async fn block_number_with_timestamp(
+    async fn block_number_with_timestamp_and_parent_hash(
         &self,
         block_hash: &BlockHash,
-    ) -> Result<Option<(BlockNumber, Option<u64>)>, StoreError>;
+    ) -> Result<Option<(BlockNumber, Option<u64>, Option<BlockHash>)>, StoreError>;
 
     fn wait_stats(&self) -> Result<PoolWaitStats, StoreError>;
-
-    async fn has_deterministic_errors(&self, block: BlockNumber) -> Result<bool, StoreError>;
 
     /// Find the current state for the subgraph deployment `id` and
     /// return details about it needed for executing queries
@@ -553,10 +613,19 @@ pub trait QueryStore: Send + Sync {
 
     fn api_schema(&self) -> Result<Arc<ApiSchema>, QueryExecutionError>;
 
+    fn input_schema(&self) -> Result<InputSchema, QueryExecutionError>;
+
     fn network_name(&self) -> &str;
 
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
+    async fn query_permit(&self) -> Result<QueryPermit, StoreError>;
+
+    /// Report the name of the shard in which the subgraph is stored. This
+    /// should only be used for reporting and monitoring
+    fn shard(&self) -> &str;
+
+    /// Return the deployment id that is queried by this `QueryStore`
+    fn deployment_id(&self) -> DeploymentId;
 }
 
 /// A view of the store that can provide information about the indexing status
@@ -564,7 +633,7 @@ pub trait QueryStore: Send + Sync {
 #[async_trait]
 pub trait StatusStore: Send + Sync + 'static {
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
+    async fn query_permit(&self) -> Result<QueryPermit, StoreError>;
 
     fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError>;
 
@@ -606,5 +675,15 @@ pub trait StatusStore: Send + Sync + 'static {
         &self,
         subgraph_id: &DeploymentHash,
         block_number: BlockNumber,
+        fetch_block_ptr: &dyn BlockPtrForNumber,
     ) -> Result<Option<(PartialBlockPtr, [u8; 32])>, StoreError>;
+}
+
+#[async_trait]
+pub trait BlockPtrForNumber: Send + Sync {
+    async fn block_ptr_for_number(
+        &self,
+        network: String,
+        number: BlockNumber,
+    ) -> Result<Option<BlockPtr>, Error>;
 }

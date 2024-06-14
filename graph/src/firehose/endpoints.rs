@@ -4,9 +4,11 @@ use crate::{
     blockchain::BlockPtr,
     cheap_clone::CheapClone,
     components::store::BlockNumber,
+    data::value::Word,
     endpoint::{ConnectionType, EndpointMetrics, Provider, RequestLabels},
+    env::ENV_VARS,
     firehose::decode_firehose_block,
-    prelude::{anyhow, debug, info},
+    prelude::{anyhow, debug, info, DeploymentHash},
     substreams_rpc,
 };
 
@@ -16,12 +18,19 @@ use futures03::StreamExt;
 use http::uri::{Scheme, Uri};
 use itertools::Itertools;
 use slog::Logger;
-use std::{collections::BTreeMap, fmt::Display, ops::ControlFlow, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Display,
+    ops::ControlFlow,
+    sync::Arc,
+    time::Duration,
+};
 use tonic::codegen::InterceptedService;
 use tonic::{
     codegen::CompressionEncoding,
-    metadata::{Ascii, MetadataValue},
+    metadata::{Ascii, MetadataKey, MetadataValue},
     transport::{Channel, ClientTlsConfig},
+    Request,
 };
 
 use super::{codec as firehose, interceptors::MetricsInterceptor, stream_client::StreamClient};
@@ -44,6 +53,29 @@ pub struct FirehoseEndpoint {
     pub subgraph_limit: SubgraphLimit,
     endpoint_metrics: Arc<EndpointMetrics>,
     channel: Channel,
+}
+
+#[derive(Debug)]
+pub struct ConnectionHeaders(HashMap<MetadataKey<Ascii>, MetadataValue<Ascii>>);
+
+impl ConnectionHeaders {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+    pub fn with_deployment(mut self, deployment: DeploymentHash) -> Self {
+        if let Ok(deployment) = deployment.parse() {
+            self.0
+                .insert("x-deployment-id".parse().unwrap(), deployment);
+        }
+        self
+    }
+    pub fn add_to_request<T>(&self, request: T) -> Request<T> {
+        let mut request = Request::new(request);
+        self.0.iter().for_each(|(k, v)| {
+            request.metadata_mut().insert(k, v.clone());
+        });
+        request
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Ord, Eq, PartialOrd)]
@@ -112,6 +144,7 @@ impl FirehoseEndpoint {
         provider: S,
         url: S,
         token: Option<String>,
+        key: Option<String>,
         filters_enabled: bool,
         compression_enabled: bool,
         subgraph_limit: SubgraphLimit,
@@ -137,6 +170,12 @@ impl FirehoseEndpoint {
                 bearer_token.parse::<MetadataValue<Ascii>>().map(Some)
             })
             .expect("Firehose token is invalid");
+
+        let key: Option<MetadataValue<Ascii>> = key
+            .map_or(Ok(None), |key| {
+                key.parse::<MetadataValue<Ascii>>().map(Some)
+            })
+            .expect("Firehose key is invalid");
 
         // Note on the connection window size: We run multiple block streams on a same connection,
         // and a problematic subgraph with a stalled block stream might consume the entire window
@@ -167,7 +206,7 @@ impl FirehoseEndpoint {
         FirehoseEndpoint {
             provider: provider.as_ref().into(),
             channel: endpoint.connect_lazy(),
-            auth: AuthInterceptor { token },
+            auth: AuthInterceptor { token, key },
             filters_enabled,
             compression_enabled,
             subgraph_limit,
@@ -235,6 +274,9 @@ impl FirehoseEndpoint {
             client = client.send_compressed(CompressionEncoding::Gzip);
         }
 
+        client = client
+            .max_decoding_message_size(1024 * 1024 * ENV_VARS.firehose_grpc_max_decode_size_mb);
+
         client
     }
 
@@ -276,7 +318,8 @@ impl FirehoseEndpoint {
     {
         debug!(
             logger,
-            "Connecting to firehose to retrieve block for cursor {}", cursor
+            "Connecting to firehose to retrieve block for cursor {}", cursor;
+            "provider" => self.provider.as_str(),
         );
 
         let req = firehose::SingleBlockRequest {
@@ -301,7 +344,8 @@ impl FirehoseEndpoint {
     where
         M: prost::Message + BlockchainBlock + Default + 'static,
     {
-        info!(logger, "Requesting genesis block from firehose");
+        info!(logger, "Requesting genesis block from firehose";
+            "provider" => self.provider.as_str());
 
         // We use 0 here to mean the genesis block of the chain. Firehose
         // when seeing start block number 0 will always return the genesis
@@ -320,7 +364,8 @@ impl FirehoseEndpoint {
     {
         debug!(
             logger,
-            "Connecting to firehose to retrieve block for number {}", number
+            "Connecting to firehose to retrieve block for number {}", number;
+            "provider" => self.provider.as_str(),
         );
 
         let mut client = self.new_stream_client();
@@ -348,7 +393,8 @@ impl FirehoseEndpoint {
 
         let mut block_stream = response_stream.into_inner();
 
-        debug!(logger, "Retrieving block(s) from firehose");
+        debug!(logger, "Retrieving block(s) from firehose";
+               "provider" => self.provider.as_str());
 
         let mut latest_received_block: Option<BlockPtr> = None;
         while let Some(message) = block_stream.next().await {
@@ -392,8 +438,10 @@ impl FirehoseEndpoint {
     pub async fn stream_blocks(
         self: Arc<Self>,
         request: firehose::Request,
+        headers: &ConnectionHeaders,
     ) -> Result<tonic::Streaming<firehose::Response>, anyhow::Error> {
         let mut client = self.new_stream_client();
+        let request = headers.add_to_request(request);
         let response_stream = client.blocks(request).await?;
         let block_stream = response_stream.into_inner();
 
@@ -403,8 +451,10 @@ impl FirehoseEndpoint {
     pub async fn substreams(
         self: Arc<Self>,
         request: substreams_rpc::Request,
+        headers: &ConnectionHeaders,
     ) -> Result<tonic::Streaming<substreams_rpc::Response>, anyhow::Error> {
         let mut client = self.new_substreams_client();
+        let request = headers.add_to_request(request);
         let response_stream = client.blocks(request).await?;
         let block_stream = response_stream.into_inner();
 
@@ -494,18 +544,21 @@ impl FirehoseNetworks {
         }
     }
 
-    /// Returns a `Vec` of tuples where the first element of the tuple is
-    /// the chain's id and the second one is an endpoint for this chain.
-    /// There can be mulitple tuple with the same chain id but with different
-    /// endpoint where multiple providers exist for a single chain id.
-    pub fn flatten(&self) -> Vec<(String, Arc<FirehoseEndpoint>)> {
+    /// Returns a `HashMap` where the key is the chain's id and the key is an endpoint for this chain.
+    /// There can be multiple keys with the same chain id but with different
+    /// endpoint where multiple providers exist for a single chain id. Providers with the same
+    /// label do not need to be tested individually, if one is working, every other endpoint in the
+    /// pool should also work.
+    pub fn flatten(&self) -> HashMap<(String, Word), Arc<FirehoseEndpoint>> {
         self.networks
             .iter()
             .flat_map(|(chain_id, firehose_endpoints)| {
-                firehose_endpoints
-                    .0
-                    .iter()
-                    .map(move |endpoint| (chain_id.clone(), endpoint.clone()))
+                firehose_endpoints.0.iter().map(move |endpoint| {
+                    (
+                        (chain_id.clone(), endpoint.provider.clone()),
+                        endpoint.clone(),
+                    )
+                })
             })
             .collect()
     }
@@ -528,6 +581,7 @@ mod test {
         let endpoint = vec![Arc::new(FirehoseEndpoint::new(
             String::new(),
             "http://127.0.0.1".to_string(),
+            None,
             None,
             false,
             false,
@@ -561,6 +615,7 @@ mod test {
             String::new(),
             "http://127.0.0.1".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Limit(2),
@@ -593,6 +648,7 @@ mod test {
             String::new(),
             "http://127.0.0.1".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Disabled,
@@ -624,6 +680,7 @@ mod test {
             "high_error".to_string(),
             "http://127.0.0.1".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Unlimited,
@@ -632,6 +689,7 @@ mod test {
         let high_error_adapter2 = Arc::new(FirehoseEndpoint::new(
             "high_error".to_string(),
             "http://127.0.0.1".to_string(),
+            None,
             None,
             false,
             false,
@@ -642,6 +700,7 @@ mod test {
             "low availability".to_string(),
             "http://127.0.0.2".to_string(),
             None,
+            None,
             false,
             false,
             SubgraphLimit::Limit(2),
@@ -650,6 +709,7 @@ mod test {
         let high_availability = Arc::new(FirehoseEndpoint::new(
             "high availability".to_string(),
             "http://127.0.0.3".to_string(),
+            None,
             None,
             false,
             false,

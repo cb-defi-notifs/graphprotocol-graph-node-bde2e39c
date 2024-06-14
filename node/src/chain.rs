@@ -1,17 +1,18 @@
 use crate::config::{Config, ProviderDetails};
 use ethereum::{EthereumNetworks, ProviderEthRpcMetrics};
-use futures::future::{join_all, try_join_all};
-use futures::TryFutureExt;
 use graph::anyhow::{bail, Error};
 use graph::blockchain::{Block as BlockchainBlock, BlockchainKind, ChainIdentifier};
 use graph::cheap_clone::CheapClone;
 use graph::endpoint::EndpointMetrics;
 use graph::firehose::{FirehoseEndpoint, FirehoseNetworks, SubgraphLimit};
+use graph::futures03::future::{join_all, try_join_all};
+use graph::futures03::TryFutureExt;
 use graph::ipfs_client::IpfsClient;
 use graph::prelude::{anyhow, tokio};
 use graph::prelude::{prost, MetricsRegistry};
 use graph::slog::{debug, error, info, o, Logger};
 use graph::url::Url;
+use graph::util::futures::retry;
 use graph::util::security::SafeDisplay;
 use graph_chain_ethereum::{self as ethereum, EthereumAdapterTrait, Transport};
 use std::collections::{btree_map, BTreeMap};
@@ -139,6 +140,7 @@ pub fn create_substreams_networks(
                             &provider.label,
                             &firehose.url,
                             firehose.token.clone(),
+                            firehose.key.clone(),
                             firehose.filters_enabled(),
                             firehose.compression_enabled(),
                             SubgraphLimit::Unlimited,
@@ -195,6 +197,7 @@ pub fn create_firehose_networks(
                             &provider.label,
                             &firehose.url,
                             firehose.token.clone(),
+                            firehose.key.clone(),
                             firehose.filters_enabled(),
                             firehose.compression_enabled(),
                             firehose.limit_for(&config.node),
@@ -323,18 +326,27 @@ where
             .flatten()
             .into_iter()
             .map(|(chain_id, endpoint)| (chain_id, endpoint, logger.clone()))
-            .map(|(chain_id, endpoint, logger)| async move {
+            .map(|((chain_id, _), endpoint, logger)| async move {
                 let logger = logger.new(o!("provider" => endpoint.provider.to_string()));
                 info!(
                     logger, "Connecting to Firehose to get chain identifier";
                     "provider" => &endpoint.provider.to_string(),
                 );
-                match tokio::time::timeout(
-                    NET_VERSION_WAIT_TIME,
-                    endpoint.genesis_block_ptr::<M>(&logger),
-                )
-                .await
-                .map_err(Error::from)
+
+                let retry_endpoint = endpoint.clone();
+                let retry_logger = logger.clone();
+                let req = retry("firehose startup connection test", &logger)
+                    .no_limit()
+                    .no_timeout()
+                    .run(move || {
+                        let retry_endpoint = retry_endpoint.clone();
+                        let retry_logger = retry_logger.clone();
+                        async move { retry_endpoint.genesis_block_ptr::<M>(&retry_logger).await }
+                    });
+
+                match tokio::time::timeout(NET_VERSION_WAIT_TIME, req)
+                    .await
+                    .map_err(Error::from)
                 {
                     // An `Err` means a timeout, an `Ok(Err)` means some other error (maybe a typo
                     // on the URL)

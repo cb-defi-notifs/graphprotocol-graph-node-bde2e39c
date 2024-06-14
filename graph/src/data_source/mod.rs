@@ -8,21 +8,27 @@ mod tests;
 
 use crate::{
     blockchain::{
-        BlockPtr, Blockchain, DataSource as _, DataSourceTemplate as _, MappingTriggerTrait,
-        TriggerData as _, UnresolvedDataSource as _, UnresolvedDataSourceTemplate as _,
+        Block, BlockPtr, BlockTime, Blockchain, DataSource as _, DataSourceTemplate as _,
+        MappingTriggerTrait, TriggerData as _, UnresolvedDataSource as _,
+        UnresolvedDataSourceTemplate as _,
     },
     components::{
         link_resolver::LinkResolver,
-        store::{BlockNumber, EntityType, StoredDynamicDataSource},
+        store::{BlockNumber, StoredDynamicDataSource},
     },
     data_source::offchain::OFFCHAIN_KINDS,
     prelude::{CheapClone as _, DataSourceContext},
+    schema::{EntityType, InputSchema},
 };
 use anyhow::Error;
 use semver::Version;
 use serde::{de::IntoDeserializer as _, Deserialize, Deserializer};
 use slog::{Logger, SendSyncRefUnwindSafeKV};
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -62,7 +68,7 @@ impl fmt::Display for EntityTypeAccess {
         match self {
             Self::Any => write!(f, "Any"),
             Self::Restriced(entities) => {
-                let strings = entities.iter().map(|e| e.as_str()).collect::<Vec<_>>();
+                let strings = entities.iter().map(|e| e.typename()).collect::<Vec<_>>();
                 write!(f, "{}", strings.join(", "))
             }
         }
@@ -93,6 +99,14 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
+    pub fn is_onchain(&self) -> bool {
+        self.as_onchain().is_some()
+    }
+
+    pub fn is_offchain(&self) -> bool {
+        self.as_offchain().is_some()
+    }
+
     pub fn address(&self) -> Option<Vec<u8>> {
         match self {
             Self::Onchain(ds) => ds.address().map(ToOwned::to_owned),
@@ -107,10 +121,24 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> String {
         match self {
-            Self::Onchain(ds) => ds.kind(),
-            Self::Offchain(ds) => &ds.kind,
+            Self::Onchain(ds) => ds.kind().to_owned(),
+            Self::Offchain(ds) => ds.kind.to_string(),
+        }
+    }
+
+    pub fn min_spec_version(&self) -> Version {
+        match self {
+            Self::Onchain(ds) => ds.min_spec_version(),
+            Self::Offchain(ds) => ds.min_spec_version(),
+        }
+    }
+
+    pub fn end_block(&self) -> Option<BlockNumber> {
+        match self {
+            Self::Onchain(ds) => ds.end_block(),
+            Self::Offchain(_) => None,
         }
     }
 
@@ -151,6 +179,13 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
+    pub fn handler_kinds(&self) -> HashSet<&str> {
+        match self {
+            Self::Onchain(ds) => ds.handler_kinds(),
+            Self::Offchain(ds) => vec![ds.handler_kind()].into_iter().collect(),
+        }
+    }
+
     pub fn match_and_decode(
         &self,
         trigger: &TriggerData<C>,
@@ -158,6 +193,7 @@ impl<C: Blockchain> DataSource<C> {
         logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<MappingTrigger<C>>>, Error> {
         match (self, trigger) {
+            (Self::Onchain(ds), _) if ds.has_expired(block.number()) => Ok(None),
             (Self::Onchain(ds), TriggerData::Onchain(trigger)) => ds
                 .match_and_decode(trigger, block, logger)
                 .map(|t| t.map(|t| t.map(MappingTrigger::Onchain))),
@@ -200,9 +236,9 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
-    pub fn validate(&self) -> Vec<Error> {
+    pub fn validate(&self, spec_version: &semver::Version) -> Vec<Error> {
         match self {
-            Self::Onchain(ds) => ds.validate(),
+            Self::Onchain(ds) => ds.validate(spec_version),
             Self::Offchain(_) => vec![],
         }
     }
@@ -243,6 +279,15 @@ impl<C: Blockchain> UnresolvedDataSource<C> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DataSourceTemplateInfo {
+    pub api_version: semver::Version,
+    pub runtime: Option<Arc<Vec<u8>>>,
+    pub name: String,
+    pub manifest_idx: Option<u32>,
+    pub kind: String,
+}
+
 #[derive(Debug)]
 pub enum DataSourceTemplate<C: Blockchain> {
     Onchain(C::DataSourceTemplate),
@@ -250,6 +295,13 @@ pub enum DataSourceTemplate<C: Blockchain> {
 }
 
 impl<C: Blockchain> DataSourceTemplate<C> {
+    pub fn info(&self) -> DataSourceTemplateInfo {
+        match self {
+            DataSourceTemplate::Onchain(template) => template.info(),
+            DataSourceTemplate::Offchain(template) => template.clone().into(),
+        }
+    }
+
     pub fn as_onchain(&self) -> Option<&C::DataSourceTemplate> {
         match self {
             Self::Onchain(ds) => Some(ds),
@@ -273,7 +325,7 @@ impl<C: Blockchain> DataSourceTemplate<C> {
 
     pub fn name(&self) -> &str {
         match self {
-            Self::Onchain(ds) => ds.name(),
+            Self::Onchain(ds) => &ds.name(),
             Self::Offchain(ds) => &ds.name,
         }
     }
@@ -302,7 +354,7 @@ impl<C: Blockchain> DataSourceTemplate<C> {
     pub fn kind(&self) -> String {
         match self {
             Self::Onchain(ds) => ds.kind().to_string(),
-            Self::Offchain(ds) => ds.kind.to_owned(),
+            Self::Offchain(ds) => ds.kind.to_string(),
         }
     }
 }
@@ -323,6 +375,7 @@ impl<C: Blockchain> UnresolvedDataSourceTemplate<C> {
     pub async fn resolve(
         self,
         resolver: &Arc<dyn LinkResolver>,
+        schema: &InputSchema,
         logger: &Logger,
         manifest_idx: u32,
     ) -> Result<DataSourceTemplate<C>, Error> {
@@ -330,9 +383,9 @@ impl<C: Blockchain> UnresolvedDataSourceTemplate<C> {
             Self::Onchain(ds) => ds
                 .resolve(resolver, logger, manifest_idx)
                 .await
-                .map(DataSourceTemplate::Onchain),
+                .map(|ti| DataSourceTemplate::Onchain(ti)),
             Self::Offchain(ds) => ds
-                .resolve(resolver, logger, manifest_idx)
+                .resolve(resolver, logger, manifest_idx, schema)
                 .await
                 .map(DataSourceTemplate::Offchain),
         }
@@ -343,6 +396,7 @@ pub struct TriggerWithHandler<T> {
     pub trigger: T,
     handler: String,
     block_ptr: BlockPtr,
+    timestamp: BlockTime,
     logging_extras: Arc<dyn SendSyncRefUnwindSafeKV>,
 }
 
@@ -356,25 +410,28 @@ impl<T: fmt::Debug> fmt::Debug for TriggerWithHandler<T> {
 }
 
 impl<T> TriggerWithHandler<T> {
-    pub fn new(trigger: T, handler: String, block_ptr: BlockPtr) -> Self {
-        Self {
+    pub fn new(trigger: T, handler: String, block_ptr: BlockPtr, timestamp: BlockTime) -> Self {
+        Self::new_with_logging_extras(
             trigger,
             handler,
             block_ptr,
-            logging_extras: Arc::new(slog::o! {}),
-        }
+            timestamp,
+            Arc::new(slog::o! {}),
+        )
     }
 
     pub fn new_with_logging_extras(
         trigger: T,
         handler: String,
         block_ptr: BlockPtr,
+        timestamp: BlockTime,
         logging_extras: Arc<dyn SendSyncRefUnwindSafeKV>,
     ) -> Self {
         TriggerWithHandler {
             trigger,
             handler,
             block_ptr,
+            timestamp,
             logging_extras,
         }
     }
@@ -393,6 +450,7 @@ impl<T> TriggerWithHandler<T> {
             trigger: f(self.trigger),
             handler: self.handler,
             block_ptr: self.block_ptr,
+            timestamp: self.timestamp,
             logging_extras: self.logging_extras,
         }
     }
@@ -400,8 +458,13 @@ impl<T> TriggerWithHandler<T> {
     pub fn block_ptr(&self) -> BlockPtr {
         self.block_ptr.clone()
     }
+
+    pub fn timestamp(&self) -> BlockTime {
+        self.timestamp
+    }
 }
 
+#[derive(Debug)]
 pub enum TriggerData<C: Blockchain> {
     Onchain(C::TriggerData),
     Offchain(offchain::TriggerData),
@@ -412,13 +475,6 @@ impl<C: Blockchain> TriggerData<C> {
         match self {
             Self::Onchain(trigger) => trigger.error_context(),
             Self::Offchain(trigger) => format!("{:?}", trigger.source),
-        }
-    }
-
-    pub fn address_match(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Onchain(trigger) => trigger.address_match().map(|address| address.to_owned()),
-            Self::Offchain(trigger) => trigger.source.address(),
         }
     }
 }
@@ -434,6 +490,13 @@ impl<C: Blockchain> MappingTrigger<C> {
         match self {
             Self::Onchain(trigger) => Some(trigger.error_context()),
             Self::Offchain(_) => None, // TODO: Add error context for offchain triggers
+        }
+    }
+
+    pub fn as_onchain(&self) -> Option<&C::MappingTrigger> {
+        match self {
+            Self::Onchain(trigger) => Some(trigger),
+            Self::Offchain(_) => None,
         }
     }
 }
@@ -467,7 +530,7 @@ macro_rules! deserialize_data_source {
                     .ok_or(serde::de::Error::missing_field("kind"))?
                     .as_str()
                     .unwrap_or("?");
-                if OFFCHAIN_KINDS.contains(&kind) {
+                if OFFCHAIN_KINDS.contains_key(&kind) {
                     offchain::$t::deserialize(map.into_deserializer())
                         .map_err(serde::de::Error::custom)
                         .map($t::Offchain)

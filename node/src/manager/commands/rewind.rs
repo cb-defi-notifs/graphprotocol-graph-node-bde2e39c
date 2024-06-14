@@ -3,13 +3,15 @@ use std::thread;
 use std::time::Duration;
 use std::{collections::HashSet, convert::TryFrom};
 
+use crate::manager::commands::assign::pause_or_resume;
+use crate::manager::deployment::{Deployment, DeploymentSearch};
 use graph::anyhow::bail;
 use graph::components::store::{BlockStore as _, ChainStore as _};
-use graph::prelude::{anyhow, BlockNumber, BlockPtr, NodeId, SubgraphStore};
-use graph_store_postgres::BlockStore;
+use graph::env::ENV_VARS;
+use graph::prelude::{anyhow, BlockNumber, BlockPtr};
+use graph_store_postgres::command_support::catalog::{self as store_catalog};
 use graph_store_postgres::{connection_pool::ConnectionPool, Store};
-
-use crate::manager::deployment::{Deployment, DeploymentSearch};
+use graph_store_postgres::{BlockStore, NotificationSender};
 
 async fn block_ptr(
     store: Arc<BlockStore>,
@@ -36,7 +38,7 @@ async fn block_ptr(
         None => bail!("can not find chain store for {}", chain),
         Some(store) => store,
     };
-    if let Some((_, number, _)) = chain_store.block_number(&block_ptr_to.hash).await? {
+    if let Some((_, number, _, _)) = chain_store.block_number(&block_ptr_to.hash).await? {
         if number != block_ptr_to.number {
             bail!(
                 "the given hash is for block number {} but the command specified block number {}",
@@ -61,29 +63,35 @@ pub async fn run(
     searches: Vec<DeploymentSearch>,
     block_hash: Option<String>,
     block_number: Option<BlockNumber>,
+    sender: &NotificationSender,
     force: bool,
     sleep: Duration,
     start_block: bool,
 ) -> Result<(), anyhow::Error> {
-    const PAUSED: &str = "paused_";
-
     // Sanity check
     if !start_block && (block_hash.is_none() || block_number.is_none()) {
         bail!("--block-hash and --block-number must be specified when --start-block is not set");
     }
+    let pconn = primary.get()?;
+    let mut conn = store_catalog::Connection::new(pconn);
 
     let subgraph_store = store.subgraph_store();
     let block_store = store.block_store();
 
-    let deployments = searches
-        .iter()
-        .map(|search| search.lookup(&primary))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut deployments = Vec::new();
+    for search in &searches {
+        let results = search.lookup(&primary)?;
+        if results.len() > 1 {
+            bail!(
+                "Multiple deployments found for the search : {}. Try using the id of the deployment (eg: sgd143) to uniquely identify the deployment.",
+                search
+            );
+        }
+        deployments.extend(results);
+    }
+
     if deployments.is_empty() {
-        println!("nothing to do");
+        println!("No deployments found");
         return Ok(());
     }
 
@@ -103,30 +111,39 @@ pub async fn run(
         )
     };
 
-    println!("Pausing deployments");
-    let mut paused = false;
+    println!("Checking if its safe to rewind deployments");
     for deployment in &deployments {
-        if let Some(node) = &deployment.node_id {
-            if !node.starts_with(PAUSED) {
-                let loc = deployment.locator();
-                let node =
-                    NodeId::new(format!("{}{}", PAUSED, node)).expect("paused_ node id is valid");
-                subgraph_store.reassign_subgraph(&loc, &node)?;
-                println!("  ... paused {}", loc);
-                paused = true;
-            }
+        let locator = &deployment.locator();
+        let site = conn
+            .locate_site(locator.clone())?
+            .ok_or_else(|| anyhow!("failed to locate site for {locator}"))?;
+        let deployment_store = subgraph_store.for_site(&site)?;
+        let deployment_details = deployment_store.deployment_details_for_id(locator)?;
+        let block_number_to = block_ptr_to.as_ref().map(|b| b.number).unwrap_or(0);
+
+        if block_number_to < deployment_details.earliest_block_number + ENV_VARS.reorg_threshold {
+            bail!(
+                "The block number {} is not safe to rewind to for deployment {}. The earliest block number of this deployment is {}. You can only safely rewind to block number {}",
+                block_ptr_to.as_ref().map(|b| b.number).unwrap_or(0),
+                locator,
+                deployment_details.earliest_block_number,
+                deployment_details.earliest_block_number + ENV_VARS.reorg_threshold
+            );
         }
     }
 
-    if paused {
-        // There's no good way to tell that a subgraph has in fact stopped
-        // indexing. We sleep and hope for the best.
-        println!(
-            "\nWaiting {}s to make sure pausing was processed",
-            sleep.as_secs()
-        );
-        thread::sleep(sleep);
+    println!("Pausing deployments");
+    for deployment in &deployments {
+        pause_or_resume(primary.clone(), &sender, &deployment.locator(), true)?;
     }
+
+    // There's no good way to tell that a subgraph has in fact stopped
+    // indexing. We sleep and hope for the best.
+    println!(
+        "\nWaiting {}s to make sure pausing was processed",
+        sleep.as_secs()
+    );
+    thread::sleep(sleep);
 
     println!("\nRewinding deployments");
     for deployment in &deployments {
@@ -158,11 +175,7 @@ pub async fn run(
 
     println!("Resuming deployments");
     for deployment in &deployments {
-        if let Some(node) = &deployment.node_id {
-            let loc = deployment.locator();
-            let node = NodeId::new(node.clone()).expect("node id is valid");
-            subgraph_store.reassign_subgraph(&loc, &node)?;
-        }
+        pause_or_resume(primary.clone(), &sender, &deployment.locator(), false)?;
     }
     Ok(())
 }

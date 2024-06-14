@@ -1,6 +1,8 @@
-use super::block_stream::{BlockStream, BlockStreamEvent, FirehoseMapper};
+use super::block_stream::{
+    BlockStream, BlockStreamError, BlockStreamEvent, FirehoseMapper, FIREHOSE_BUFFER_STREAM_SIZE,
+};
 use super::client::ChainClient;
-use super::{Blockchain, TriggersAdapter};
+use super::Blockchain;
 use crate::blockchain::block_stream::FirehoseCursor;
 use crate::blockchain::TriggerFilter;
 use crate::prelude::*;
@@ -98,7 +100,7 @@ impl FirehoseBlockStreamMetrics {
 }
 
 pub struct FirehoseBlockStream<C: Blockchain> {
-    stream: Pin<Box<dyn Stream<Item = Result<BlockStreamEvent<C>, Error>> + Send>>,
+    stream: Pin<Box<dyn Stream<Item = Result<BlockStreamEvent<C>, BlockStreamError>> + Send>>,
 }
 
 impl<C> FirehoseBlockStream<C>
@@ -111,8 +113,6 @@ where
         subgraph_current_block: Option<BlockPtr>,
         cursor: FirehoseCursor,
         mapper: Arc<F>,
-        adapter: Arc<dyn TriggersAdapter<C>>,
-        filter: Arc<C::TriggerFilter>,
         start_blocks: Vec<BlockNumber>,
         logger: Logger,
         registry: Arc<MetricsRegistry>,
@@ -138,8 +138,6 @@ where
                 cursor,
                 deployment,
                 mapper,
-                adapter,
-                filter,
                 manifest_start_block_num,
                 subgraph_current_block,
                 logger,
@@ -154,13 +152,11 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
     mut latest_cursor: FirehoseCursor,
     deployment: DeploymentHash,
     mapper: Arc<F>,
-    adapter: Arc<dyn TriggersAdapter<C>>,
-    filter: Arc<C::TriggerFilter>,
     manifest_start_block_num: BlockNumber,
     subgraph_current_block: Option<BlockPtr>,
     logger: Logger,
     metrics: FirehoseBlockStreamMetrics,
-) -> impl Stream<Item = Result<BlockStreamEvent<C>, Error>> {
+) -> impl Stream<Item = Result<BlockStreamEvent<C>, BlockStreamError>> {
     let mut subgraph_current_block = subgraph_current_block;
     let mut start_block_num = subgraph_current_block
         .as_ref()
@@ -207,6 +203,8 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
         debug!(&logger, "Going to check continuity of chain on first block");
     }
 
+    let headers = firehose::ConnectionHeaders::new().with_deployment(deployment.clone());
+
     // Back off exponentially whenever we encounter a connection error or a stream with bad data
     let mut backoff = ExponentialBackoff::new(Duration::from_millis(500), Duration::from_secs(45));
 
@@ -240,11 +238,11 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
             };
 
             if endpoint.filters_enabled {
-                request.transforms = filter.as_ref().clone().to_firehose_filter();
+                request.transforms = mapper.trigger_filter().clone().to_firehose_filter();
             }
 
             let mut connect_start = Instant::now();
-            let req = endpoint.clone().stream_blocks(request);
+            let req = endpoint.clone().stream_blocks(request, &headers);
             let result = tokio::time::timeout(Duration::from_secs(120), req).await.map_err(|x| x.into()).and_then(|x| x);
 
             match result {
@@ -265,8 +263,6 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                             manifest_start_block_num,
                             subgraph_current_block.as_ref(),
                             mapper.as_ref(),
-                            &adapter,
-                            &filter,
                             &logger,
                         ).await {
                             Ok(BlockResponse::Proceed(event, cursor)) => {
@@ -354,14 +350,12 @@ async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
     manifest_start_block_num: BlockNumber,
     subgraph_current_block: Option<&BlockPtr>,
     mapper: &F,
-    adapter: &Arc<dyn TriggersAdapter<C>>,
-    filter: &C::TriggerFilter,
     logger: &Logger,
 ) -> Result<BlockResponse<C>, Error> {
     let response = result.context("An error occurred while streaming blocks")?;
 
     let event = mapper
-        .to_block_stream_event(logger, &response, adapter, filter)
+        .to_block_stream_event(logger, &response)
         .await
         .context("Mapping block to BlockStreamEvent failed")?;
 
@@ -414,14 +408,18 @@ async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
 }
 
 impl<C: Blockchain> Stream for FirehoseBlockStream<C> {
-    type Item = Result<BlockStreamEvent<C>, Error>;
+    type Item = Result<BlockStreamEvent<C>, BlockStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.stream.poll_next_unpin(cx)
     }
 }
 
-impl<C: Blockchain> BlockStream<C> for FirehoseBlockStream<C> {}
+impl<C: Blockchain> BlockStream<C> for FirehoseBlockStream<C> {
+    fn buffer_size_hint(&self) -> usize {
+        FIREHOSE_BUFFER_STREAM_SIZE
+    }
+}
 
 fn must_check_subgraph_continuity(
     logger: &Logger,
